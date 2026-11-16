@@ -9,6 +9,15 @@
  *   sudo bpftrace -B line observer/observer.bt <TARGET_PID>
  *
  * Output: one JSON event per line on stdout
+ *
+ * NOTE — Hardcoded library paths (Bug 3):
+ *   The uprobe paths below are hardcoded to /lib/x86_64-linux-gnu/ for
+ *   Ubuntu/Debian x86_64. On aarch64 the correct prefix is
+ *   /lib/aarch64-linux-gnu/. On glibc >= 2.34 libpthread is merged into libc
+ *   and the separate libpthread.so.0 path may not exist. The collector's
+ *   _build_comm_script() / _detect_lib_paths() handles this dynamically for
+ *   --exec mode; for direct use of this .bt file you may need to edit the
+ *   paths below to match your host's layout.
  */
 
 BEGIN
@@ -17,11 +26,14 @@ BEGIN
 }
 
 /* ── LOCK_REQUEST: thread is blocking on a contended futex ──────────── */
+/* Bug 1 fix: guard with @mu_arg[tid] != 0 so that pthread_cond_wait    */
+/* futexes (which do NOT go through pthread_mutex_lock entry) are        */
+/* excluded.  Only emit when we know a mutex lock is in-flight.          */
 tracepoint:syscalls:sys_enter_futex
-/pid == $1 && ((args->op & 0x7f) == 0)/
+/pid == $1 && ((args->op & 0x7f) == 0) && @mu_arg[tid] != 0/
 {
     @pending[tid] = (uint64)args->uaddr;
-    printf("{{\"timestamp_ns\":%llu,\"pid\":%d,\"tid\":%d,\"resource\":\"0x%llx\",\"operation\":\"LOCK_REQUEST\"}}\n",
+    printf("{\"timestamp_ns\":%llu,\"pid\":%d,\"tid\":%d,\"resource\":\"0x%llx\",\"operation\":\"LOCK_REQUEST\"}\n",
         nsecs, pid, tid, (uint64)args->uaddr);
 }
 
@@ -51,7 +63,7 @@ uretprobe:/lib/x86_64-linux-gnu/libpthread.so.0:pthread_mutex_lock,
 uretprobe:/lib/x86_64-linux-gnu/libc.so.6:pthread_mutex_lock
 /pid == $1 && @mu_arg[tid] != 0 && retval == 0/
 {
-    printf("{{\"timestamp_ns\":%llu,\"pid\":%d,\"tid\":%d,\"resource\":\"0x%llx\",\"operation\":\"LOCK_ACQUIRED\"}}\n",
+    printf("{\"timestamp_ns\":%llu,\"pid\":%d,\"tid\":%d,\"resource\":\"0x%llx\",\"operation\":\"LOCK_ACQUIRED\"}\n",
         nsecs, pid, tid, @mu_arg[tid]);
     delete(@mu_arg[tid]);
 }
@@ -68,7 +80,7 @@ uprobe:/lib/x86_64-linux-gnu/libpthread.so.0:pthread_mutex_unlock,
 uprobe:/lib/x86_64-linux-gnu/libc.so.6:pthread_mutex_unlock
 /pid == $1/
 {
-    printf("{{\"timestamp_ns\":%llu,\"pid\":%d,\"tid\":%d,\"resource\":\"0x%llx\",\"operation\":\"LOCK_RELEASED\"}}\n",
+    printf("{\"timestamp_ns\":%llu,\"pid\":%d,\"tid\":%d,\"resource\":\"0x%llx\",\"operation\":\"LOCK_RELEASED\"}\n",
         nsecs, pid, tid, (uint64)arg0);
 }
 
@@ -82,7 +94,7 @@ uprobe:/lib/x86_64-linux-gnu/libc.so.6:sem_wait
 uretprobe:/lib/x86_64-linux-gnu/libc.so.6:sem_wait
 /pid == $1 && @sem_arg[tid] != 0 && retval == 0/
 {
-    printf("{{\"timestamp_ns\":%llu,\"pid\":%d,\"tid\":%d,\"resource\":\"0x%llx\",\"operation\":\"LOCK_ACQUIRED\"}}\n",
+    printf("{\"timestamp_ns\":%llu,\"pid\":%d,\"tid\":%d,\"resource\":\"0x%llx\",\"operation\":\"LOCK_ACQUIRED\"}\n",
         nsecs, pid, tid, @sem_arg[tid]);
     delete(@sem_arg[tid]);
 }
@@ -96,7 +108,7 @@ uretprobe:/lib/x86_64-linux-gnu/libc.so.6:sem_wait
 uprobe:/lib/x86_64-linux-gnu/libc.so.6:sem_post
 /pid == $1/
 {
-    printf("{{\"timestamp_ns\":%llu,\"pid\":%d,\"tid\":%d,\"resource\":\"0x%llx\",\"operation\":\"LOCK_RELEASED\"}}\n",
+    printf("{\"timestamp_ns\":%llu,\"pid\":%d,\"tid\":%d,\"resource\":\"0x%llx\",\"operation\":\"LOCK_RELEASED\"}\n",
         nsecs, pid, tid, (uint64)arg0);
 }
 

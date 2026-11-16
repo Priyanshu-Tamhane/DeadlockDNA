@@ -266,11 +266,11 @@ class BenchmarkRunner:
                         workload_name=name,
                         run_index=i,
                         expected_deadlock=expected,
-                        detected_deadlock=h_res.timed_out if expected else False,
+                        detected_deadlock=h_res.timed_out,
                         elapsed_sec=h_res.elapsed_sec,
                         exit_code=h_res.exit_code,
                         timed_out=h_res.timed_out,
-                        observer_mode="baseline",
+                        observer_mode="baseline_timeout",
                         stdout=h_res.stdout,
                         stderr=h_res.stderr,
                     )

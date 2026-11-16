@@ -19,8 +19,10 @@ logger = logging.getLogger(__name__)
 class CycleDetector:
     def __init__(self) -> None:
         self._formation_ts_ns: Optional[int] = None
+        self._last_graph_generation: int = -1   # tracks structural changes
 
-    def detect(self, graph: nx.DiGraph, formation_ts_ns: int) -> List[DeadlockResult]:
+    def detect(self, graph: nx.DiGraph, formation_ts_ns: int,
+               operation: str = "") -> List[DeadlockResult]:
         """
         Detect all cycles in the RAG.
 
@@ -28,11 +30,20 @@ class CycleDetector:
             graph:           Current Resource Allocation Graph.
             formation_ts_ns: Timestamp of the event that triggered this check.
                              Used as "when the deadlock was formed" for latency.
+            operation:       Optional hint — name of the Operation enum value
+                             (e.g. "LOCK_REQUEST").  Detection is skipped unless
+                             this is "LOCK_REQUEST" (or empty, for callers that
+                             do not supply the hint).
 
         Returns:
             List of DeadlockResult — one per cycle. Empty if no deadlock.
         """
-        if graph.number_of_edges() == 0:
+        # Fast path 1: skip non-request events — deadlocks only form on requests.
+        if operation and operation != "LOCK_REQUEST":
+            return []
+
+        # Fast path 2: a 2-way deadlock needs at least 4 edges (2 request + 2 allocation).
+        if graph.number_of_edges() < 4:
             self._formation_ts_ns = None
             return []
 

@@ -1,4 +1,4 @@
-﻿"""
+"""
 models.py — DeadlockDNA Data Models (graph/)
 
 Shared types used by the graph engine and the rest of the pipeline.
@@ -39,10 +39,11 @@ class DeadlockResult:
     cycle: List[str]        # node names, closing node repeated at end
     threads: List[int]      # TIDs in the cycle
     resources: List[str]    # scoped resource IDs in the cycle
-    diagnosis: Optional[Any] = None       # Feature A: Explainable diagnosis
-    fingerprint: Optional[str] = None     # Feature B: SHA-256 structural DNA
-    occurrence_count: int = 1             # Feature B: Recurrence counter
+    diagnosis: Optional[Any] = None         # Feature A: Explainable diagnosis
+    fingerprint: Optional[str] = None       # Feature B: SHA-256 structural DNA
+    occurrence_count: int = 1               # Feature B: Recurrence counter
     canonical_pattern: Optional[str] = None # Feature B: Role-based canonical pattern
+    recovery_plan: Optional[Any] = None     # Feature E: Cost-aware recovery recommendations
 
     @property
     def latency_us(self) -> float:

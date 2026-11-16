@@ -2,7 +2,7 @@
 main.py — DeadlockDNA Pipeline Entry Point
 
 Complete detection pipeline run from project root:
-  Target program → eBPF observer → Collector → RAG → Cycle Detector → Explainer → DNA → Risk → Dashboard
+  Target program → eBPF observer → Collector → RAG → Cycle Detector → Explainer → DNA → Risk → Recovery → Dashboard
 
 Usage (from /home/priyanshu/deadlockdna):
 
@@ -20,6 +20,7 @@ Usage (from /home/priyanshu/deadlockdna):
 """
 
 import argparse
+import sys
 import logging
 import sys
 import time
@@ -43,6 +44,7 @@ from graph.cycle_detector import CycleDetector
 from diagnosis.explainer import DeadlockExplainer
 from dna import DeadlockStore, fingerprint_cycle
 from risk import LockOrderTracker, RiskCycleDetector, RiskStore, LockOrderRisk
+from recovery import RecoveryPolicyEngine
 from ui.dashboard import Dashboard
 
 
@@ -67,25 +69,26 @@ logger = logging.getLogger(__name__)
 # Pipeline
 # ------------------------------------------------------------------
 
-def run(collector, target_name: str, pid: int) -> None:
+def run(collector, target_name: str, pid: int, is_disposable: bool = False) -> None:
     """
     Core pipeline:
-      event → RAG.process_event → cycle_detector.detect → explainer.explain → dna.fingerprint → risk_tracker.process → dashboard.update
+      event → RAG.process_event → cycle_detector.detect → explainer.explain → dna.fingerprint → risk_tracker.process → recovery_engine.evaluate → dashboard.update
     """
-    rag           = ResourceAllocationGraph()
-    detector      = CycleDetector()
-    explainer     = DeadlockExplainer()
-    store         = DeadlockStore()
-    risk_tracker  = LockOrderTracker(session_id=target_name)
-    risk_detector = RiskCycleDetector()
-    risk_store    = RiskStore()
-    dash          = Dashboard(target_name=target_name, pid=pid)
+    rag             = ResourceAllocationGraph()
+    detector        = CycleDetector()
+    explainer       = DeadlockExplainer()
+    store           = DeadlockStore()
+    risk_tracker    = LockOrderTracker(session_id=target_name)
+    risk_detector   = RiskCycleDetector()
+    risk_store      = RiskStore()
+    recovery_engine = RecoveryPolicyEngine()
+    dash            = Dashboard(target_name=target_name, pid=pid)
 
     deadlocks: list[DeadlockResult] = []
     active_risks: list[LockOrderRisk] = []
     notified  = False
 
-    logger.info("pipeline started — target=%s pid=%d", target_name, pid)
+    logger.info("pipeline started — target=%s pid=%d (disposable=%s)", target_name, pid, is_disposable)
 
     try:
         with dash.live_context():
@@ -99,7 +102,8 @@ def run(collector, target_name: str, pid: int) -> None:
                 rag.process_event(event)
 
                 # Step 2: detect RAG cycles (live circular waits)
-                new_dl = detector.detect(rag.get_graph(), event.timestamp_ns)
+                new_dl = detector.detect(rag.get_graph(), event.timestamp_ns,
+                                         operation=event.operation.name)
 
                 if new_dl:
                     for dl in new_dl:
@@ -125,6 +129,16 @@ def run(collector, target_name: str, pid: int) -> None:
                         except Exception as e:
                             logger.warning("fingerprint recording error: %s", e)
 
+                        # Feature E: Cost-aware recovery recommendations
+                        try:
+                            dl.recovery_plan = recovery_engine.evaluate_deadlock(
+                                deadlock=dl,
+                                pid=event.pid or pid,
+                                is_disposable_workload=is_disposable,
+                            )
+                        except Exception as e:
+                            logger.warning("recovery plan generation error: %s", e)
+
                     deadlocks = new_dl
                     if not notified:
                         logger.warning("DEADLOCK DETECTED — %d cycle(s)", len(new_dl))
@@ -143,13 +157,12 @@ def run(collector, target_name: str, pid: int) -> None:
                         logger.debug("risk edge record error: %s", e)
 
                 detected_risks = risk_detector.detect_risks(risk_tracker.graph)
-                if detected_risks:
-                    for rk in detected_risks:
-                        try:
-                            risk_store.record_risk(rk)
-                        except Exception as e:
-                            logger.debug("risk warning record error: %s", e)
-                    active_risks = detected_risks
+                active_risks = detected_risks
+                for rk in detected_risks:
+                    try:
+                        risk_store.record_risk(rk)
+                    except Exception as e:
+                        logger.debug("risk warning record error: %s", e)
 
                 # Step 4: refresh dashboard with RAG, active deadlocks, and predictive risks
                 dash.update(event, rag, deadlocks, risks=active_risks)
@@ -189,6 +202,8 @@ def main() -> None:
                       help="read JSON events from stdin")
     p.add_argument("--delay", type=float, default=0.5,
                       help="delay between events in seconds for file replay (default: 0.5s)")
+    p.add_argument("--disposable", action="store_true",
+                      help="indicate target is an isolated disposable test workload (enables test recovery options)")
     p.add_argument("--verbose", "-v", action="store_true")
     args = p.parse_args()
 
@@ -196,6 +211,7 @@ def main() -> None:
 
     try:
         if args.pid:
+            print("[deadlockdna] WARNING: --pid mode attaches to a running process. Events before attachment are missed and the deadlock may have already occurred.", file=sys.stderr)
             name, pid, gen = f"pid-{args.pid}", args.pid, collect_from_pid(args.pid)
 
         elif args.exec_p:
@@ -210,7 +226,7 @@ def main() -> None:
             name, pid = "stdin", 0
             gen = collect_from_stdin()
 
-        run(gen, target_name=name, pid=pid)
+        run(gen, target_name=name, pid=pid, is_disposable=args.disposable)
 
     except CollectorError as e:
         print(f"\n[deadlockdna] ERROR: {e}", file=sys.stderr)

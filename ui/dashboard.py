@@ -198,11 +198,18 @@ class Dashboard:
                     parts.append(Text("Limitations:", style="dim yellow"))
                     for lim in diag.limitations:
                         parts.append(Text(f"  - {lim}", style="dim"))
-            else:
-                parts.append(Text(
-                    f"Threads  : {', '.join(f'T{t}' for t in dl.threads)}", style="cyan"))
-                parts.append(Text(
-                    f"Resources: {', '.join(dl.resources)}", style="yellow"))
+
+            if dl.recovery_plan:
+                plan = dl.recovery_plan
+                parts.append(Text("\nRecovery Recommendations (Feature E):", style="bold green"))
+                if plan.top_recommendation:
+                    top = plan.top_recommendation
+                    parts.append(Text(f"  ★ Recommended: {top.action_type.value} -> target: {top.target_id} (score: {top.score:.2f})", style="bold green"))
+                    parts.append(Text(f"    Rationale: {top.ranking_rationale}", style="dim"))
+                if plan.rejected_candidates:
+                    parts.append(Text("  Safety Policy Ineligibility Checks:", style="bold red"))
+                    for rej in plan.rejected_candidates[:2]:
+                        parts.append(Text(f"    ✗ Rejected {rej.action_type.value}: {rej.ineligibility_reason}", style="dim red"))
 
             parts.append(Text(
                 f"\nDetection latency: {dl.latency_us:.1f} µs", style="bold white"))

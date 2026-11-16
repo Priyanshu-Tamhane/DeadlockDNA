@@ -23,6 +23,8 @@ from .models import Event, Operation, thread_node, resource_node
 
 logger = logging.getLogger(__name__)
 
+_REQUEST_EDGE_TTL_NS = 30_000_000_000  # 30 seconds — prune stale request edges
+
 
 class ResourceAllocationGraph:
     def __init__(self) -> None:
@@ -70,11 +72,23 @@ class ResourceAllocationGraph:
 
         if owner_tid is not None:
             owner_t = thread_node(owner_tid)
-            if not self._holder.get(r):
+            current_holder = self._holder.get(r)
+            if not current_holder:
+                # No holder recorded yet — add a new inferred allocation edge.
                 self._g.add_edge(r, owner_t, kind="allocation", inferred=True,
                                  timestamp_ns=ts_ns, source="futex_owner_word")
                 self._holder[r] = owner_t
                 logger.debug("RAG +alloc (inferred from futex owner) %s → %s", r, owner_t)
+            elif current_holder != owner_t:
+                # Existing holder is stale — only replace if it was inferred.
+                edge_data = self._g.edges.get((r, current_holder), {})
+                if edge_data.get("inferred", False):
+                    self._g.remove_edge(r, current_holder)
+                    logger.debug("RAG -alloc (stale inferred) %s → %s", r, current_holder)
+                    self._g.add_edge(r, owner_t, kind="allocation", inferred=True,
+                                     timestamp_ns=ts_ns, source="futex_owner_word")
+                    self._holder[r] = owner_t
+                    logger.debug("RAG +alloc (updated inferred) %s → %s", r, owner_t)
 
     def _acquired(self, t: str, r: str, ts_ns: Optional[int] = None) -> None:
         """Thread T acquired resource R.
@@ -107,5 +121,17 @@ class ResourceAllocationGraph:
         self._prune()
 
     def _prune(self) -> None:
+        # Remove stale request edges (missed LOCK_ACQUIRED uprobes cause them to linger).
+        if self.last_event_ts_ns:
+            cutoff = self.last_event_ts_ns - _REQUEST_EDGE_TTL_NS
+            stale_requests = [
+                (u, v)
+                for u, v, d in list(self._g.edges(data=True))
+                if d.get("kind") == "request" and (d.get("timestamp_ns") or 0) < cutoff
+            ]
+            for u, v in stale_requests:
+                self._g.remove_edge(u, v)
+                logger.debug("RAG -request (TTL expired) %s → %s", u, v)
+
         isolated = [n for n in list(self._g.nodes()) if self._g.degree(n) == 0]
         self._g.remove_nodes_from(isolated)

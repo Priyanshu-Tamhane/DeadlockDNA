@@ -9,13 +9,14 @@ Does NOT perform deadlock detection — only collects and normalizes events.
 
 import argparse
 import logging
+import os
 import queue
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Generator, Optional
+from typing import Generator, Optional, Tuple
 
 _HERE = Path(__file__).parent
 _OBSERVER_BT = _HERE.parent / "observer" / "observer.bt"
@@ -30,9 +31,55 @@ class CollectorError(Exception):
     pass
 
 
-# Standard library paths for pthread / libc on Ubuntu/Debian x86_64
-_LIBPTHREAD = "/lib/x86_64-linux-gnu/libpthread.so.0"
-_LIBC       = "/lib/x86_64-linux-gnu/libc.so.6"
+# ---------------------------------------------------------------------------
+# Bug 3 fix — dynamic library path detection
+# ---------------------------------------------------------------------------
+
+def _detect_lib_paths() -> Tuple[Optional[str], str]:
+    """
+    Detect the correct libpthread and libc paths for the current architecture.
+
+    Returns (libpthread_path_or_None, libc_path).
+
+    - On x86_64 (Ubuntu/Debian) paths live under /lib/x86_64-linux-gnu/.
+    - On aarch64 they live under /lib/aarch64-linux-gnu/.
+    - On glibc >= 2.34 libpthread is merged into libc; libpthread.so.0 may
+      not exist at all — in that case the first element is None and callers
+      must omit libpthread uprobe lines.
+    """
+    _ARCH_PREFIXES = [
+        "/lib/x86_64-linux-gnu",
+        "/lib/aarch64-linux-gnu",
+        "/lib/arm-linux-gnueabihf",
+        "/lib/riscv64-linux-gnu",
+    ]
+
+    libpthread: Optional[str] = None
+    libc: Optional[str] = None
+
+    for prefix in _ARCH_PREFIXES:
+        lp = f"{prefix}/libpthread.so.0"
+        lc = f"{prefix}/libc.so.6"
+        if os.path.exists(lc):
+            libc = lc
+            if os.path.exists(lp):
+                libpthread = lp
+            break
+
+    if libc is None:
+        # Fallback: try bare /lib (some distros, e.g. Alpine-derived)
+        if os.path.exists("/lib/libc.so.6"):
+            libc = "/lib/libc.so.6"
+            if os.path.exists("/lib/libpthread.so.0"):
+                libpthread = "/lib/libpthread.so.0"
+
+    if libc is None:
+        raise CollectorError(
+            "Could not find libc.so.6 in any known location. "
+            "Set _LIBC manually or install glibc."
+        )
+
+    return libpthread, libc
 
 
 def _build_comm_script(prog_name: str) -> str:
@@ -44,30 +91,51 @@ def _build_comm_script(prog_name: str) -> str:
     Includes futex tracepoints (for LOCK_REQUEST/blocking waits), uprobes on
     pthread_mutex_lock/unlock, and uprobes on sem_wait/sem_post (for POSIX semaphores).
     Truncates prog_name to 15 chars to match Linux TASK_COMM_LEN.
+
+    Bug 1 fix: sys_enter_futex only emits LOCK_REQUEST when @mu_arg[tid] != 0,
+    i.e. when pthread_mutex_lock entry has been recorded for this thread.
+    This prevents pthread_cond_wait futexes from being misclassified as
+    LOCK_REQUEST events.
+
+    Bug 3 fix: library paths are detected dynamically via _detect_lib_paths()
+    to support both x86_64 and aarch64, and glibc >= 2.34 (no libpthread).
     """
     p = prog_name[:15]
-    lp = _LIBPTHREAD
-    lc = _LIBC
+    libpthread, lc = _detect_lib_paths()
+
+    # Build uprobe line prefixes — omit libpthread lines when it doesn't exist
+    # (glibc >= 2.34 merges pthread into libc).
+    def _mu_lock_uprobes(kind: str) -> str:
+        if libpthread:
+            return f"{kind}:{libpthread}:pthread_mutex_lock, {kind}:{lc}:pthread_mutex_lock"
+        return f"{kind}:{lc}:pthread_mutex_lock"
+
+    def _mu_unlock_uprobes(kind: str) -> str:
+        if libpthread:
+            return f"{kind}:{libpthread}:pthread_mutex_unlock, {kind}:{lc}:pthread_mutex_unlock"
+        return f"{kind}:{lc}:pthread_mutex_unlock"
+
     lines = [
         f'BEGIN {{ printf("# deadlockdna observer started — watching comm={p}\\n"); }}',
-        f'tracepoint:syscalls:sys_enter_futex /comm == "{p}" && ((args->op & 0x7f) == 0)/ {{',
+        # Bug 1: gate on @mu_arg[tid] != 0 to exclude cond_wait futexes
+        f'tracepoint:syscalls:sys_enter_futex /comm == "{p}" && ((args->op & 0x7f) == 0) && @mu_arg[tid] != 0/ {{',
         '    @pending[tid] = (uint64)args->uaddr;',
         r'    printf("{\"timestamp_ns\":%llu,\"pid\":%d,\"tid\":%d,\"resource\":\"0x%llx\",\"operation\":\"LOCK_REQUEST\"}\n", nsecs, pid, tid, (uint64)args->uaddr);',
         '}',
         f'tracepoint:syscalls:sys_exit_futex /comm == "{p}" && @pending[tid] != 0/ {{',
         '    delete(@pending[tid]);',
         '}',
-        f'uprobe:{lp}:pthread_mutex_lock, uprobe:{lc}:pthread_mutex_lock /comm == "{p}"/ {{',
+        f'{_mu_lock_uprobes("uprobe")} /comm == "{p}"/ {{',
         '    @mu_arg[tid] = (uint64)arg0;',
         '}',
-        f'uretprobe:{lp}:pthread_mutex_lock, uretprobe:{lc}:pthread_mutex_lock /comm == "{p}" && @mu_arg[tid] != 0 && retval == 0/ {{',
+        f'{_mu_lock_uprobes("uretprobe")} /comm == "{p}" && @mu_arg[tid] != 0 && retval == 0/ {{',
         r'    printf("{\"timestamp_ns\":%llu,\"pid\":%d,\"tid\":%d,\"resource\":\"0x%llx\",\"operation\":\"LOCK_ACQUIRED\"}\n", nsecs, pid, tid, @mu_arg[tid]);',
         '    delete(@mu_arg[tid]);',
         '}',
-        f'uretprobe:{lp}:pthread_mutex_lock, uretprobe:{lc}:pthread_mutex_lock /comm == "{p}" && @mu_arg[tid] != 0 && retval != 0/ {{',
+        f'{_mu_lock_uprobes("uretprobe")} /comm == "{p}" && @mu_arg[tid] != 0 && retval != 0/ {{',
         '    delete(@mu_arg[tid]);',
         '}',
-        f'uprobe:{lp}:pthread_mutex_unlock, uprobe:{lc}:pthread_mutex_unlock /comm == "{p}"/ {{',
+        f'{_mu_unlock_uprobes("uprobe")} /comm == "{p}"/ {{',
         r'    printf("{\"timestamp_ns\":%llu,\"pid\":%d,\"tid\":%d,\"resource\":\"0x%llx\",\"operation\":\"LOCK_RELEASED\"}\n", nsecs, pid, tid, (uint64)arg0);',
         '}',
         f'uprobe:{lc}:sem_wait /comm == "{p}"/ {{',
@@ -86,6 +154,24 @@ def _build_comm_script(prog_name: str) -> str:
         r'END { printf("# deadlockdna observer stopped.\n"); clear(@pending); clear(@mu_arg); clear(@sem_arg); }',
     ]
     return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Bug 2 fix — stderr drain helper
+# ---------------------------------------------------------------------------
+
+def _drain_stderr(proc: subprocess.Popen, log: logging.Logger) -> None:
+    """
+    Read all lines from proc.stderr and log them at WARNING level.
+    Intended to be run in a daemon thread so the stderr pipe never blocks.
+    """
+    try:
+        for line in proc.stderr:
+            stripped = line.rstrip("\n")
+            if stripped:
+                log.warning("bpftrace stderr: %s", stripped)
+    except Exception:
+        pass  # process died — stop silently
 
 
 # ---------------------------------------------------------------------------
@@ -108,8 +194,8 @@ def collect_from_pid(pid: int) -> Generator[Event, None, None]:
     except PermissionError:
         raise CollectorError("Permission denied. Run with sudo.")
 
-    # Drain stderr in background to prevent pipe from blocking
-    threading.Thread(target=lambda: proc.stderr.read(), daemon=True).start()
+    # Drain stderr in background — log each line at WARNING level (Bug 2 fix)
+    threading.Thread(target=_drain_stderr, args=(proc, logger), daemon=True).start()
 
     logger.info("bpftrace running (pid=%d), watching target pid=%d", proc.pid, pid)
 
@@ -171,8 +257,8 @@ def collect_from_exec(program: str, args: Optional[list] = None) -> Generator[Ev
     except PermissionError:
         raise CollectorError("Permission denied. Run with sudo.")
 
-    # Drain stderr in background
-    threading.Thread(target=lambda: proc.stderr.read(), daemon=True).start()
+    # Drain stderr in background — log each line at WARNING level (Bug 2 fix)
+    threading.Thread(target=_drain_stderr, args=(proc, logger), daemon=True).start()
 
     event_queue: queue.Queue = queue.Queue()
     ready_event = threading.Event()
