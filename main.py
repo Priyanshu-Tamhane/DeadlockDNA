@@ -1,8 +1,8 @@
-﻿"""
+"""
 main.py — DeadlockDNA Pipeline Entry Point
 
 Complete detection pipeline run from project root:
-  Target program → eBPF observer → Collector → RAG → Cycle Detector → Dashboard
+  Target program → eBPF observer → Collector → RAG → Cycle Detector → Explainer → DNA → Risk → Dashboard
 
 Usage (from /home/priyanshu/deadlockdna):
 
@@ -42,6 +42,7 @@ from graph.rag import ResourceAllocationGraph
 from graph.cycle_detector import CycleDetector
 from diagnosis.explainer import DeadlockExplainer
 from dna import DeadlockStore, fingerprint_cycle
+from risk import LockOrderTracker, RiskCycleDetector, RiskStore, LockOrderRisk
 from ui.dashboard import Dashboard
 
 
@@ -69,14 +70,19 @@ logger = logging.getLogger(__name__)
 def run(collector, target_name: str, pid: int) -> None:
     """
     Core pipeline:
-      event → RAG.process_event → cycle_detector.detect → explainer.explain → dna.fingerprint → dashboard.update
+      event → RAG.process_event → cycle_detector.detect → explainer.explain → dna.fingerprint → risk_tracker.process → dashboard.update
     """
-    rag       = ResourceAllocationGraph()
-    detector  = CycleDetector()
-    explainer = DeadlockExplainer()
-    store     = DeadlockStore()
-    dash      = Dashboard(target_name=target_name, pid=pid)
+    rag           = ResourceAllocationGraph()
+    detector      = CycleDetector()
+    explainer     = DeadlockExplainer()
+    store         = DeadlockStore()
+    risk_tracker  = LockOrderTracker(session_id=target_name)
+    risk_detector = RiskCycleDetector()
+    risk_store    = RiskStore()
+    dash          = Dashboard(target_name=target_name, pid=pid)
+
     deadlocks: list[DeadlockResult] = []
+    active_risks: list[LockOrderRisk] = []
     notified  = False
 
     logger.info("pipeline started — target=%s pid=%d", target_name, pid)
@@ -92,7 +98,7 @@ def run(collector, target_name: str, pid: int) -> None:
                 # Step 1: update RAG
                 rag.process_event(event)
 
-                # Step 2: detect cycles
+                # Step 2: detect RAG cycles (live circular waits)
                 new_dl = detector.detect(rag.get_graph(), event.timestamp_ns)
 
                 if new_dl:
@@ -128,8 +134,25 @@ def run(collector, target_name: str, pid: int) -> None:
                     notified  = False
                     logger.info("deadlock cycle resolved")
 
-                # Step 3: refresh dashboard
-                dash.update(event, rag, deadlocks)
+                # Step 3: Feature D - Lock-order tracking & predictive risk analysis
+                new_edges = risk_tracker.process_event(event)
+                for edge_ev in new_edges:
+                    try:
+                        risk_store.record_edge(edge_ev)
+                    except Exception as e:
+                        logger.debug("risk edge record error: %s", e)
+
+                detected_risks = risk_detector.detect_risks(risk_tracker.graph)
+                if detected_risks:
+                    for rk in detected_risks:
+                        try:
+                            risk_store.record_risk(rk)
+                        except Exception as e:
+                            logger.debug("risk warning record error: %s", e)
+                    active_risks = detected_risks
+
+                # Step 4: refresh dashboard with RAG, active deadlocks, and predictive risks
+                dash.update(event, rag, deadlocks, risks=active_risks)
 
     except KeyboardInterrupt:
         logger.info("pipeline interrupted by user")
@@ -140,6 +163,7 @@ def run(collector, target_name: str, pid: int) -> None:
         raise
     finally:
         store.close()
+        risk_store.close()
 
     logger.info("pipeline stopped")
 

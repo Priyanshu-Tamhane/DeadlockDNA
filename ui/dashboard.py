@@ -1,16 +1,16 @@
-﻿"""
+"""
 dashboard.py — DeadlockDNA Terminal Dashboard (ui/)
 
 Rich-based live terminal dashboard.
 
-Updated from pipeline via dashboard.update(event, rag, deadlocks).
+Updated from pipeline via dashboard.update(event, rag, deadlocks, risks).
 The detection pipeline drives the dashboard — not the reverse.
 """
 
 import time
 from collections import deque
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Any
 
 from rich import box
 from rich.console import Console, Group
@@ -41,7 +41,7 @@ class Dashboard:
             for event in events:
                 rag.process_event(event)
                 deadlocks = detector.detect(...)
-                dash.update(event, rag, deadlocks)
+                dash.update(event, rag, deadlocks, risks)
     """
 
     def __init__(self, target_name: str, pid: int) -> None:
@@ -51,6 +51,7 @@ class Dashboard:
         self._live: Optional[Live] = None
         self._events: deque = deque(maxlen=_MAX_EVENTS)
         self._deadlocks: List[DeadlockResult] = []
+        self._risks: List[Any] = []
         self._t0 = time.time()
         self._n_events = 0
 
@@ -60,13 +61,18 @@ class Dashboard:
         return self._live
 
     def update(self, event, rag: ResourceAllocationGraph,
-               deadlocks: List[DeadlockResult]) -> None:
+               deadlocks: List[DeadlockResult],
+               risks: Optional[List[Any]] = None) -> None:
         self._events.append(event)
         self._n_events += 1
         if deadlocks:
             self._deadlocks = deadlocks
         elif not deadlocks and self._deadlocks:
             self._deadlocks = []          # cycle resolved
+
+        if risks is not None:
+            self._risks = risks
+
         if self._live:
             self._live.update(self._render(rag))
 
@@ -81,6 +87,8 @@ class Dashboard:
             self._events_panel(),
         ]
         parts.append(self._rag_panel(rag))
+        if self._risks:
+            parts.append(self._risk_panel())
         parts.append(self._status_panel())
 
         return Panel(
@@ -134,6 +142,21 @@ class Dashboard:
             body = Group(*lines)
 
         return Panel(body, title="[yellow]Resource Allocation Graph[/yellow]",
+                     border_style="yellow", padding=(0, 1))
+
+    def _risk_panel(self) -> Panel:
+        parts = []
+        for rk in self._risks:
+            parts.append(Text("⚠  LOCK-ORDER INVERSION (Predictive Risk)", style="bold yellow on dark_goldenrod"))
+            parts.append(Text(f"Pattern : {rk.pattern}", style="bold yellow"))
+            threads_str = ", ".join(f"T{t}" for t in rk.threads_involved)
+            parts.append(Text(f"Scope   : {rk.scope} | Threads: {threads_str} | Confidence: {rk.confidence.upper()}", style="dim"))
+            parts.append(Text("Note    : This is a predictive lock-order risk, not an active deadlock hang.", style="dim italic"))
+            parts.append(Text(""))
+        if parts:
+            parts.pop()  # remove trailing empty line
+
+        return Panel(Group(*parts), title="[yellow]Lock-Order Risk Analysis (Feature D)[/yellow]",
                      border_style="yellow", padding=(0, 1))
 
     def _status_panel(self) -> Panel:
