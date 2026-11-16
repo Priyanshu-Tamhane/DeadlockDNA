@@ -1,0 +1,109 @@
+#!/usr/bin/env bpftrace
+/*
+ * observer.bt — DeadlockDNA eBPF Observer
+ *
+ * Traces both futex syscalls AND pthread_mutex/sem uprobes to build a complete
+ * Resource Allocation Graph including uncontended mutex acquisitions.
+ *
+ * Usage:
+ *   sudo bpftrace -B line observer/observer.bt <TARGET_PID>
+ *
+ * Output: one JSON event per line on stdout
+ */
+
+BEGIN
+{
+    printf("# deadlockdna observer started — watching pid=%d\n", $1);
+}
+
+/* ── LOCK_REQUEST: thread is blocking on a contended futex ──────────── */
+tracepoint:syscalls:sys_enter_futex
+/pid == $1 && ((args->op & 0x7f) == 0)/
+{
+    @pending[tid] = (uint64)args->uaddr;
+    printf("{{\"timestamp_ns\":%llu,\"pid\":%d,\"tid\":%d,\"resource\":\"0x%llx\",\"operation\":\"LOCK_REQUEST\"}}\n",
+        nsecs, pid, tid, (uint64)args->uaddr);
+}
+
+/* ── Remove stale pending on EAGAIN / EINTR (did not actually block) ─── */
+tracepoint:syscalls:sys_exit_futex
+/pid == $1 && @pending[tid] != 0 && args->ret != 0/
+{
+    delete(@pending[tid]);
+}
+
+/* ── Remove stale pending on successful futex wake (covered by uprobe) ─ */
+tracepoint:syscalls:sys_exit_futex
+/pid == $1 && @pending[tid] != 0 && args->ret == 0/
+{
+    delete(@pending[tid]);
+}
+
+/* ── LOCK_ACQUIRED: pthread_mutex_lock returned (lock obtained) ──────── */
+uprobe:/lib/x86_64-linux-gnu/libpthread.so.0:pthread_mutex_lock,
+uprobe:/lib/x86_64-linux-gnu/libc.so.6:pthread_mutex_lock
+/pid == $1/
+{
+    @mu_arg[tid] = (uint64)arg0;
+}
+
+uretprobe:/lib/x86_64-linux-gnu/libpthread.so.0:pthread_mutex_lock,
+uretprobe:/lib/x86_64-linux-gnu/libc.so.6:pthread_mutex_lock
+/pid == $1 && @mu_arg[tid] != 0 && retval == 0/
+{
+    printf("{{\"timestamp_ns\":%llu,\"pid\":%d,\"tid\":%d,\"resource\":\"0x%llx\",\"operation\":\"LOCK_ACQUIRED\"}}\n",
+        nsecs, pid, tid, @mu_arg[tid]);
+    delete(@mu_arg[tid]);
+}
+
+uretprobe:/lib/x86_64-linux-gnu/libpthread.so.0:pthread_mutex_lock,
+uretprobe:/lib/x86_64-linux-gnu/libc.so.6:pthread_mutex_lock
+/pid == $1 && @mu_arg[tid] != 0 && retval != 0/
+{
+    delete(@mu_arg[tid]);
+}
+
+/* ── LOCK_RELEASED: pthread_mutex_unlock called ─────────────────────── */
+uprobe:/lib/x86_64-linux-gnu/libpthread.so.0:pthread_mutex_unlock,
+uprobe:/lib/x86_64-linux-gnu/libc.so.6:pthread_mutex_unlock
+/pid == $1/
+{
+    printf("{{\"timestamp_ns\":%llu,\"pid\":%d,\"tid\":%d,\"resource\":\"0x%llx\",\"operation\":\"LOCK_RELEASED\"}}\n",
+        nsecs, pid, tid, (uint64)arg0);
+}
+
+/* ── POSIX Semaphore support: sem_wait and sem_post ─────────────────── */
+uprobe:/lib/x86_64-linux-gnu/libc.so.6:sem_wait
+/pid == $1/
+{
+    @sem_arg[tid] = (uint64)arg0;
+}
+
+uretprobe:/lib/x86_64-linux-gnu/libc.so.6:sem_wait
+/pid == $1 && @sem_arg[tid] != 0 && retval == 0/
+{
+    printf("{{\"timestamp_ns\":%llu,\"pid\":%d,\"tid\":%d,\"resource\":\"0x%llx\",\"operation\":\"LOCK_ACQUIRED\"}}\n",
+        nsecs, pid, tid, @sem_arg[tid]);
+    delete(@sem_arg[tid]);
+}
+
+uretprobe:/lib/x86_64-linux-gnu/libc.so.6:sem_wait
+/pid == $1 && @sem_arg[tid] != 0 && retval != 0/
+{
+    delete(@sem_arg[tid]);
+}
+
+uprobe:/lib/x86_64-linux-gnu/libc.so.6:sem_post
+/pid == $1/
+{
+    printf("{{\"timestamp_ns\":%llu,\"pid\":%d,\"tid\":%d,\"resource\":\"0x%llx\",\"operation\":\"LOCK_RELEASED\"}}\n",
+        nsecs, pid, tid, (uint64)arg0);
+}
+
+END
+{
+    printf("# deadlockdna observer stopped.\n");
+    clear(@pending);
+    clear(@mu_arg);
+    clear(@sem_arg);
+}

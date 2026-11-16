@@ -1,0 +1,7 @@
+{"timestamp_ns":1000000000,"pid":5000,"tid":5001,"resource":"0x1000","operation":"LOCK_ACQUIRED"}
+{"timestamp_ns":1500000000,"pid":5000,"tid":5001,"resource":"0x1000","operation":"LOCK_RELEASED"}
+{"timestamp_ns":2000000000,"pid":5000,"tid":5002,"resource":"0x2000","operation":"LOCK_ACQUIRED"}
+{"timestamp_ns":2500000000,"pid":5000,"tid":5002,"resource":"0x2000","operation":"LOCK_RELEASED"}
+{"timestamp_ns":3000000000,"pid":5000,"tid":5001,"resource":"0x2000","operation":"LOCK_ACQUIRED"}
+{"timestamp_ns":3500000000,"pid":5000,"tid":5001,"resource":"0x2000","operation":"LOCK_RELEASED"}
+

@@ -1,0 +1,48 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# C build artifacts & compiled binaries
+*.o
+*.a
+*.out
+targets/test_2way
+targets/test_3way
+targets/test_semaphore
+benchmarks/workloads/workload_no_lock
+benchmarks/workloads/workload_single_mutex
+benchmarks/workloads/workload_contention
+benchmarks/workloads/workload_stress
+benchmarks/results/
+
+# Virtual Environments
+/.venv/
+venv/
+ENV/
+env/
+.env
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs & Databases
+logs/*
+!logs/.gitkeep
+*.log
+*.db
+*.sqlite3
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Operating System files
+.DS_Store
+Thumbs.db
