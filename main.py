@@ -20,12 +20,15 @@ Usage (from /home/priyanshu/deadlockdna):
 """
 
 import argparse
-import sys
-import logging
-import time
 from contextlib import nullcontext
+from dataclasses import dataclass, field
+import logging
 from pathlib import Path
-from typing import Optional
+import queue
+import sys
+import threading
+import time
+from typing import Any, List, Optional
 
 # ------------------------------------------------------------------
 # Ensure project root is on sys.path
@@ -43,6 +46,7 @@ from graph.models import DeadlockResult
 from graph.rag import ResourceAllocationGraph
 from graph.cycle_detector import CycleDetector
 from diagnosis.explainer import DeadlockExplainer
+from diagnosis.symbol_resolver import SymbolResolver
 from dna import DeadlockStore, fingerprint_cycle
 from risk import LockOrderTracker, RiskCycleDetector, RiskStore, LockOrderRisk
 from recovery import RecoveryPolicyEngine
@@ -68,27 +72,50 @@ logger = logging.getLogger(__name__)
 
 
 # ------------------------------------------------------------------
-# Pipeline
+# Async Pipeline Components (Producer-Consumer)
 # ------------------------------------------------------------------
+
+@dataclass
+class DetectionTask:
+    kind: str  # "rag" or "risk"
+    graph_copy: Any
+    event: Event
+    pid: int
+    edges: List[Any] = field(default_factory=list)
+
+
+class PipelineState:
+    def __init__(self, target_name: str, pid: int) -> None:
+        self.target_name = target_name
+        self.pid = pid
+        self.last_event: Optional[Event] = None
+        self.deadlocks: List[DeadlockResult] = []
+        self.active_risks: List[LockOrderRisk] = []
+        self.lock = threading.Lock()
+        self.is_running = True
+
 
 def run(collector, target_name: str, pid: int, is_disposable: bool = False,
         port: int = 8080, open_browser: bool = True,
         ci_mode: bool = False, fail_on_deadlock: bool = True,
         fail_on_risk: bool = False, junit_xml: Optional[str] = None,
-        report_json: Optional[str] = None) -> int:
+        report_json: Optional[str] = None, ui_enabled: bool = True) -> int:
     """
-    Core pipeline:
-      event → RAG.process_event → cycle_detector.detect → explainer.explain → dna.fingerprint → risk_tracker.process → recovery_engine.evaluate → dashboard.update / ci_reporter
+    Decoupled async producer-consumer pipeline:
+      Ingestion Producer → event_queue → RAG Thread → detection_queue → Detector Thread
+      UI Timer periodically polls state at a controlled frame rate without blocking ingestion.
     """
     rag             = ResourceAllocationGraph()
     detector        = CycleDetector()
-    from diagnosis.symbol_resolver import SymbolResolver
-    explainer       = DeadlockExplainer(symbol_resolver=SymbolResolver(target_hint=target_name))
+    resolver        = SymbolResolver(target_hint=target_name)
+    explainer       = DeadlockExplainer(symbol_resolver=resolver)
     store           = DeadlockStore()
     risk_tracker    = LockOrderTracker(session_id=target_name)
     risk_detector   = RiskCycleDetector()
     risk_store      = RiskStore()
     recovery_engine = RecoveryPolicyEngine()
+
+    state = PipelineState(target_name=target_name, pid=pid)
 
     ci_reporter = None
     dash = None
@@ -102,50 +129,103 @@ def run(collector, target_name: str, pid: int, is_disposable: bool = False,
             report_json=report_json,
         )
         ctx = nullcontext()
+    elif not ui_enabled:
+        dash = None
+        ctx = nullcontext()
     else:
         dash = Dashboard(target_name=target_name, pid=pid, port=port, open_browser=open_browser)
         ctx = dash.live_context()
 
-    deadlocks: list[DeadlockResult] = []
-    active_risks: list[LockOrderRisk] = []
-    notified  = False
+    notified = False
+    event_queue: queue.Queue[Optional[Event]] = queue.Queue(maxsize=2000)
+    detection_queue: queue.Queue[Optional[DetectionTask]] = queue.Queue(maxsize=2000)
 
-    logger.info("pipeline started — target=%s pid=%d (disposable=%s, ci=%s)", target_name, pid, is_disposable, ci_mode)
+    logger.info("pipeline started — target=%s pid=%d (disposable=%s, ci=%s, ui=%s)",
+                target_name, pid, is_disposable, ci_mode, ui_enabled)
 
-    try:
-        with ctx:
-            for event in collector:
-                # Discover PID from first event (exec / stdin modes)
-                if pid == 0 and event.pid:
-                    pid = event.pid
-                    if dash:
-                        dash.pid = pid
+    # 1. RAG Worker Thread
+    def _rag_worker() -> None:
+        nonlocal pid
+        while True:
+            event = event_queue.get()
+            if event is None:
+                detection_queue.put(None)
+                break
 
-                # Step 1: update RAG
-                rag.process_event(event)
-                if ci_reporter:
-                    ci_reporter.on_event(event, rag)
+            if pid == 0 and event.pid:
+                pid = event.pid
+                with state.lock:
+                    state.pid = pid
+                if dash:
+                    dash.pid = pid
+                resolver.attach_process(pid)
 
-                # Step 2: detect RAG cycles (live circular waits)
-                new_dl = detector.detect(rag.get_graph(), event.timestamp_ns,
-                                         operation=event.operation.name)
+            # Update RAG
+            rag.process_event(event)
+            if ci_reporter:
+                ci_reporter.on_event(event, rag)
 
+            # Enqueue RAG detection on lock requests
+            if event.operation == Operation.LOCK_REQUEST:
+                detection_queue.put(
+                    DetectionTask(
+                        kind="rag",
+                        graph_copy=rag.get_graph().copy(),
+                        event=event,
+                        pid=pid or event.pid,
+                    )
+                )
+
+            # Update Lock-order tracker
+            new_edges = risk_tracker.process_event(event)
+            truly_new = [e for e in new_edges if e.count == 1]
+            if truly_new:
+                detection_queue.put(
+                    DetectionTask(
+                        kind="risk",
+                        graph_copy=risk_tracker.graph.copy(),
+                        event=event,
+                        pid=pid or event.pid,
+                        edges=truly_new,
+                    )
+                )
+
+            with state.lock:
+                state.last_event = event
+
+    # 2. Detector Worker Thread
+    def _detector_worker() -> None:
+        nonlocal notified
+        while True:
+            task = detection_queue.get()
+            if task is None:
+                break
+
+            if task.kind == "rag":
+                new_dl = detector.detect(
+                    task.graph_copy,
+                    task.event.timestamp_ns,
+                    operation=task.event.operation.name,
+                )
                 if new_dl:
                     for dl in new_dl:
-                        # Feature A: Generate explainable diagnosis with source symbols (Upgrade 1)
-                        dl.diagnosis = explainer.explain(dl.cycle, rag, event.timestamp_ns, pid=event.pid or pid)
-
-                        # Feature B: Deadlock DNA Fingerprinting and SQLite history
+                        dl.diagnosis = explainer.explain(
+                            dl.cycle, rag, task.event.timestamp_ns, pid=task.pid or task.event.pid
+                        )
                         try:
-                            fp, canon = fingerprint_cycle(dl.cycle)
+                            fp, canon = fingerprint_cycle(
+                                dl.cycle,
+                                resolver=resolver,
+                                pid=task.pid or task.event.pid,
+                            )
                             dl.fingerprint = fp
                             dl.canonical_pattern = canon.pattern
                             confidence = dl.diagnosis.confidence if dl.diagnosis else "complete"
                             count = store.record(
                                 fingerprint=fp,
                                 canonical_pattern=canon.pattern,
-                                detected_at_ns=event.timestamp_ns,
-                                pid=event.pid or pid,
+                                detected_at_ns=task.event.timestamp_ns,
+                                pid=task.pid or task.event.pid,
                                 tids=dl.threads,
                                 resources=dl.resources,
                                 confidence=confidence,
@@ -154,58 +234,105 @@ def run(collector, target_name: str, pid: int, is_disposable: bool = False,
                         except Exception as e:
                             logger.warning("fingerprint recording error: %s", e)
 
-                        # Feature E: Cost-aware recovery recommendations
                         try:
                             dl.recovery_plan = recovery_engine.evaluate_deadlock(
                                 deadlock=dl,
-                                pid=event.pid or pid,
+                                pid=task.pid or task.event.pid,
                                 is_disposable_workload=is_disposable,
                             )
                         except Exception as e:
                             logger.warning("recovery plan generation error: %s", e)
 
-                    deadlocks = new_dl
+                    with state.lock:
+                        state.deadlocks = new_dl
+
                     if ci_reporter:
                         ci_reporter.on_deadlocks(new_dl)
                     elif not notified:
                         logger.warning("DEADLOCK DETECTED — %d cycle(s)", len(new_dl))
                         notified = True
+
                 elif notified:
-                    deadlocks = []
-                    notified  = False
+                    with state.lock:
+                        state.deadlocks = []
+                    notified = False
                     logger.info("deadlock cycle resolved")
 
-                # Step 3: Feature D - Lock-order tracking & predictive risk analysis
-                new_edges = risk_tracker.process_event(event)
-                truly_new_edges = [e for e in new_edges if e.count == 1]
-                if truly_new_edges:
-                    for edge_ev in truly_new_edges:
-                        try:
-                            risk_store.record_edge(edge_ev)
-                        except Exception as e:
-                            logger.debug("risk edge record error: %s", e)
+            elif task.kind == "risk":
+                for edge_ev in task.edges:
+                    try:
+                        risk_store.record_edge(edge_ev)
+                    except Exception as e:
+                        logger.debug("risk edge record error: %s", e)
 
-                    detected_risks = risk_detector.detect_risks(risk_tracker.graph)
-                    active_risks = detected_risks
-                    for rk in detected_risks:
-                        try:
-                            risk_store.record_risk(rk)
-                        except Exception as e:
-                            logger.debug("risk warning record error: %s", e)
+                detected_risks = risk_detector.detect_risks(task.graph_copy)
+                with state.lock:
+                    state.active_risks = detected_risks
 
-                    if ci_reporter and detected_risks:
-                        ci_reporter.on_risks(detected_risks)
+                for rk in detected_risks:
+                    try:
+                        risk_store.record_risk(rk)
+                    except Exception as e:
+                        logger.debug("risk warning record error: %s", e)
 
-                # Step 4: refresh dashboard with RAG, active deadlocks, and predictive risks
-                if dash:
-                    dash.update(event, rag, deadlocks, risks=active_risks)
+                if ci_reporter and detected_risks:
+                    ci_reporter.on_risks(detected_risks)
 
-            # In CI mode, finalize reporter and return exit code immediately
+    # 3. UI Timer Worker
+    def _ui_timer_worker() -> None:
+        while state.is_running:
+            with state.lock:
+                ev = state.last_event
+                dls = list(state.deadlocks)
+                rks = list(state.active_risks)
+            if ev and dash:
+                dash.update(ev, rag, dls, risks=rks)
+            time.sleep(0.05)
+
+    try:
+        with ctx:
+            if pid:
+                resolver.attach_process(pid)
+
+            rag_th = threading.Thread(target=_rag_worker, daemon=True)
+            det_th = threading.Thread(target=_detector_worker, daemon=True)
+            rag_th.start()
+            det_th.start()
+
+            ui_th = None
+            if dash:
+                ui_th = threading.Thread(target=_ui_timer_worker, daemon=True)
+                ui_th.start()
+
+            for event in collector:
+                event_queue.put(event)
+
+            # End of event stream
+            event_queue.put(None)
+
+            # Wait for workers to complete remaining tasks
+            rag_th.join()
+            det_th.join()
+
+            state.is_running = False
+            if ui_th:
+                ui_th.join(timeout=0.5)
+
+            with state.lock:
+                dls = list(state.deadlocks)
+                rks = list(state.active_risks)
+
+            # Flush final state
+            if dash:
+                dash.flush(rag, dls, risks=rks)
+
             if ci_reporter:
                 return ci_reporter.finish()
 
-            # If the event stream completed (e.g. file replay), keep the Web UI alive
-            # until user interrupts with Ctrl+C so they can explore the interactive dashboard.
+            if not ui_enabled:
+                return 0
+
+            # Interactive UI keep-alive
             print(f"\n[deadlockdna] Event stream finished.", file=sys.stderr)
             print(f"[deadlockdna] 🚀 Interactive Web UI is active at: http://127.0.0.1:{dash.port if dash else port}", file=sys.stderr)
             print("[deadlockdna] Press Ctrl+C to exit.\n", file=sys.stderr)
@@ -226,6 +353,7 @@ def run(collector, target_name: str, pid: int, is_disposable: bool = False,
         logger.error("pipeline error: %s", exc, exc_info=True)
         raise
     finally:
+        state.is_running = False
         store.close()
         risk_store.close()
 
@@ -258,8 +386,8 @@ def main() -> None:
                       help="indicate target is an isolated disposable test workload (enables test recovery options)")
     p.add_argument("--port", type=int, default=8080,
                    help="web UI server port (default: 8080)")
-    p.add_argument("--ui", action="store_true", default=True,
-                   help="enable real-time web UI visualizer (enabled by default)")
+    p.add_argument("--ui", action=argparse.BooleanOptionalAction, default=True,
+                   help="enable real-time web UI visualizer (default: --ui, use --no-ui to disable)")
     p.add_argument("--no-browser", action="store_true",
                    help="do not open web browser automatically")
     p.add_argument("--ci", "--check", action="store_true", dest="ci",
@@ -283,7 +411,15 @@ def main() -> None:
             name, pid, gen = f"pid-{args.pid}", args.pid, collect_from_pid(args.pid)
 
         elif args.exec_p:
-            name, pid = Path(args.exec_p).name, 0
+            import shlex
+            exec_parts = shlex.split(args.exec_p)
+            if len(exec_parts) > 1 and Path(exec_parts[0]).name in ("python", "python3"):
+                name = Path(exec_parts[1]).name
+            elif exec_parts:
+                name = Path(exec_parts[0]).name
+            else:
+                name = "target"
+            pid = 0
             gen = collect_from_exec(args.exec_p)
 
         elif args.file_p:
@@ -307,6 +443,7 @@ def main() -> None:
             fail_on_risk=args.fail_on_risk,
             junit_xml=args.junit_xml,
             report_json=args.report_json,
+            ui_enabled=args.ui and not args.ci,
         )
         sys.exit(code)
 

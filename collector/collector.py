@@ -243,7 +243,14 @@ def collect_from_exec(program: str, args: Optional[list] = None) -> Generator[Ev
     race condition where the target deadlocks before bpftrace finishes
     JIT-compiling its probes (which can take 1–3 seconds).
     """
-    prog_name = Path(program).name
+    import shlex
+    parts = shlex.split(program)
+    if not parts:
+        raise CollectorError("No executable specified in --exec")
+    executable = parts[0]
+    extra_args = parts[1:] + (args or [])
+
+    prog_name = Path(executable).name
     bt_script = _build_comm_script(prog_name)
 
     cmd = ["bpftrace", "-B", "line", "-e", bt_script]
@@ -291,7 +298,7 @@ def collect_from_exec(program: str, args: Optional[list] = None) -> Generator[Ev
         )
 
     # bpftrace is now attached — launch the target
-    target_cmd = [program] + (args or [])
+    target_cmd = [executable] + extra_args
     logger.info("launching target: %s", " ".join(target_cmd))
     try:
         target = subprocess.Popen(target_cmd,
@@ -299,7 +306,7 @@ def collect_from_exec(program: str, args: Optional[list] = None) -> Generator[Ev
                                   stderr=subprocess.DEVNULL)
     except FileNotFoundError:
         _kill(proc)
-        raise CollectorError(f"program not found: {program}")
+        raise CollectorError(f"program not found: {executable}")
 
     logger.info("target launched with pid=%d", target.pid)
 

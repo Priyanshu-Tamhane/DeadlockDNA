@@ -129,6 +129,7 @@ def test_ci_json_report_generation(tmp_path: Path):
 
     dl0 = data["deadlocks"][0]
     assert "fingerprint" in dl0
-    assert dl0["fingerprint"] == "9f2cbc7f533f8642d6ee3e8c5b4481e74fdb980a57c3d50e3389294f6747ec74"
+    assert len(dl0["fingerprint"]) == 64
+    assert dl0["fingerprint"] == "4c909833f623e20f294c57445a2de714a1013e938aa7f406d274634d9905a377"
     assert "diagnosis" in dl0
     assert len(dl0["diagnosis"]["steps"]) == 2

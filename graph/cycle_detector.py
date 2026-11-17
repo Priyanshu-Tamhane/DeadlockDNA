@@ -1,13 +1,15 @@
 """
 cycle_detector.py — Deadlock Cycle Detection (graph/)
 
-Uses networkx.simple_cycles() (Johnson's algorithm) to find all directed
-cycles in the Resource Allocation Graph. A cycle = deadlock.
+Uses networkx.simple_cycles() (Johnson's algorithm) with strict timeout
+protection, cycle capping, and O(V + E) DFS fallback (nx.find_cycle) to find
+directed cycles in the Resource Allocation Graph. A cycle = deadlock.
 """
 
 import logging
+import threading
 import time
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import networkx as nx
 
@@ -16,8 +18,63 @@ from .models import DeadlockResult
 logger = logging.getLogger(__name__)
 
 
+def find_cycles_bounded(
+    graph: nx.DiGraph,
+    timeout_sec: float = 0.5,
+    max_cycles: int = 100,
+) -> Tuple[List[List[str]], bool]:
+    """
+    Safely discovers directed cycles within timeout_sec and max_cycles limits.
+    If Johnson's algorithm times out on complex or dense graphs, falls back
+    to O(V + E) DFS cycle finding (nx.find_cycle) to guarantee prompt detection.
+    """
+    # Fast path: check if graph is a DAG in O(V + E) time
+    if nx.is_directed_acyclic_graph(graph):
+        return [], False
+
+    raw_cycles: List[List[str]] = []
+    error_occurred = False
+
+    def _worker() -> None:
+        nonlocal error_occurred
+        try:
+            for cycle in nx.simple_cycles(graph):
+                raw_cycles.append(cycle)
+                if len(raw_cycles) >= max_cycles:
+                    break
+        except Exception as ex:
+            error_occurred = True
+            logger.error("error inside simple_cycles: %s", ex)
+
+    th = threading.Thread(target=_worker, daemon=True)
+    th.start()
+    th.join(timeout=timeout_sec)
+
+    timed_out = th.is_alive()
+    if timed_out:
+        logger.warning(
+            "nx.simple_cycles timed out after %.2fs (%d cycles found so far); evaluating fallback",
+            timeout_sec, len(raw_cycles)
+        )
+
+    # If no cycles were retrieved before timeout/error, fall back to O(V + E) find_cycle
+    if not raw_cycles:
+        try:
+            edges = list(nx.find_cycle(graph, orientation="original"))
+            if edges:
+                fallback_cycle = [u for u, v in edges]
+                raw_cycles.append(fallback_cycle)
+                logger.info("fallback find_cycle located cycle: %s", fallback_cycle)
+        except (nx.NetworkXNoCycle, Exception) as ex:
+            logger.debug("no cycle found via fallback: %s", ex)
+
+    return raw_cycles, timed_out
+
+
 class CycleDetector:
-    def __init__(self) -> None:
+    def __init__(self, timeout_sec: float = 0.5, max_cycles: int = 100) -> None:
+        self.timeout_sec = timeout_sec
+        self.max_cycles = max_cycles
         self._formation_ts_ns: Optional[int] = None
         self._last_graph_generation: int = -1   # tracks structural changes
 
@@ -48,11 +105,11 @@ class CycleDetector:
             return []
 
         t_start = time.perf_counter_ns()
-        try:
-            raw_cycles = list(nx.simple_cycles(graph))
-        except Exception as e:
-            logger.error("cycle detection error: %s", e)
-            return []
+        raw_cycles, timed_out = find_cycles_bounded(
+            graph,
+            timeout_sec=self.timeout_sec,
+            max_cycles=self.max_cycles,
+        )
         t_elapsed = time.perf_counter_ns() - t_start
 
         if not raw_cycles:
@@ -96,8 +153,8 @@ class CycleDetector:
         ordered = nodes[idx:] + nodes[:idx]
         cycle = ordered + [ordered[0]]          # close the loop
 
-        threads   = [int(n[1:]) for n in ordered if n.startswith("T")]
-        resources = [n           for n in ordered if n.startswith("M@")]
+        threads   = [int(n[1:]) for n in ordered if n.startswith("T") and n[1:].isdigit()]
+        resources = [n           for n in ordered if not (n.startswith("T") and n[1:].isdigit())]
 
         return DeadlockResult(
             detected=True,

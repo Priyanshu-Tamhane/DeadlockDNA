@@ -911,9 +911,15 @@
       const currentEdges = snap.edges || [];
       const activeIds = new Set(currentNodes.map(n => n.id));
 
-      // Remove defunct nodes
-      nodes.forEach((_, id) => {
-        if (!activeIds.has(id)) nodes.delete(id);
+      // Cache last known positions so rapidly pruned & reacquired mutexes don't jump / flicker
+      if (!window.nodePosCache) window.nodePosCache = new Map();
+
+      // Remove defunct nodes (saving last coordinates)
+      nodes.forEach((n, id) => {
+        if (!activeIds.has(id)) {
+          window.nodePosCache.set(id, { x: n.x, y: n.y, vx: n.vx, vy: n.vy });
+          nodes.delete(id);
+        }
       });
 
       // Add/update nodes
@@ -927,9 +933,20 @@
         const location = n.location || '';
 
         if (!nodes.has(n.id)) {
-          // Seed with circular initial layout
-          const angle = (i / Math.max(nTotal, 1)) * Math.PI * 2;
-          const radius = 120;
+          let initX, initY, initVx = 0, initVy = 0;
+          if (window.nodePosCache.has(n.id)) {
+            const cached = window.nodePosCache.get(n.id);
+            initX = cached.x;
+            initY = cached.y;
+            initVx = cached.vx * 0.3;
+            initVy = cached.vy * 0.3;
+          } else {
+            // Seed with circular initial layout
+            const angle = (i / Math.max(nTotal, 1)) * Math.PI * 2;
+            const radius = 120;
+            initX = Math.cos(angle) * radius;
+            initY = Math.sin(angle) * radius;
+          }
           nodes.set(n.id, {
             id: n.id,
             label: label,
@@ -937,10 +954,10 @@
             function: func,
             symbol: symbol,
             location: location,
-            x: Math.cos(angle) * radius,
-            y: Math.sin(angle) * radius,
-            vx: 0,
-            vy: 0,
+            x: initX,
+            y: initY,
+            vx: initVx,
+            vy: initVy,
             isDeadlock: isDl
           });
         } else {

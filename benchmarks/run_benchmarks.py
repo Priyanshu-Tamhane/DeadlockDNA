@@ -181,6 +181,10 @@ def main() -> None:
     if m.median_latency_us is not None:
         print(f"Median Detection Latency:   {m.median_latency_us:.1f} µs")
         print(f"p95 Detection Latency:      {m.p95_latency_us:.1f} µs")
+    if m.observer_overhead_percent is not None:
+        print(f"Observer Runtime Overhead:  {m.observer_overhead_percent:.1f}%")
+    else:
+        print("Observer Runtime Overhead:  N/A")
     print(f"Fingerprint Consistency:    {m.fingerprint_consistency * 100:.1f}%")
     print(f"Parse Errors / Event Loss:  {m.total_parse_errors}")
     print("=" * 60)

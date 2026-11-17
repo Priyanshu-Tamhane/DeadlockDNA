@@ -236,9 +236,94 @@ class BenchmarkRunner:
             parse_errors=parse_errors,
         )
 
+    def evaluate_live_binary(
+        self,
+        bin_path: Union[Path, str],
+        workload_name: str,
+        expected_deadlock: bool,
+        run_index: int = 0,
+        timeout_sec: float = 3.0,
+    ) -> WorkloadRunResult:
+        """
+        Executes a binary under live observer (bpftrace when available, or monitored observer harness),
+        measuring live event stream, true detection latency, and runtime overhead.
+        """
+        path = Path(bin_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Binary workload not found: {path}")
+
+        # Check if bpftrace is available and user is root / Linux
+        has_bpftrace = bool(shutil.which("bpftrace"))
+        is_root = (os.geteuid() == 0) if hasattr(os, "geteuid") else False
+
+        if has_bpftrace and is_root:
+            from collector.collector import collect_from_exec
+            rag = ResourceAllocationGraph()
+            detector = CycleDetector()
+            explainer = DeadlockExplainer()
+
+            detected = False
+            detected_fp = None
+            detected_canon = None
+            latency_us = None
+            event_count = 0
+            parse_errors = 0
+            t_start = time.monotonic()
+
+            try:
+                for event in collect_from_exec(str(path)):
+                    event_count += 1
+                    rag.process_event(event)
+                    results = detector.detect(rag.get_graph(), event.timestamp_ns, operation=event.operation.name)
+                    if results:
+                        detected = True
+                        for r in results:
+                            if latency_us is None:
+                                latency_us = r.latency_us
+                            try:
+                                fp, canon = fingerprint_cycle(r.cycle, resolver=explainer.symbol_resolver, pid=event.pid)
+                                detected_fp = fp
+                                detected_canon = canon.pattern
+                            except Exception as ex:
+                                logger.debug("fingerprint error: %s", ex)
+            except Exception as e:
+                logger.warning("live bpftrace execution exception: %s", e)
+
+            elapsed = time.monotonic() - t_start
+            return WorkloadRunResult(
+                workload_name=workload_name,
+                run_index=run_index,
+                expected_deadlock=expected_deadlock,
+                detected_deadlock=detected,
+                latency_us=latency_us,
+                elapsed_sec=elapsed,
+                observer_mode="live_ebpf",
+                fingerprint=detected_fp,
+                canonical_pattern=detected_canon,
+                event_count=event_count,
+                parse_errors=parse_errors,
+            )
+
+        # Fallback / non-root: run workload with monitored observer harness
+        harness = WorkloadHarness(timeout_sec=timeout_sec)
+        h_res = harness.run_command([str(path)])
+        return WorkloadRunResult(
+            workload_name=workload_name,
+            run_index=run_index,
+            expected_deadlock=expected_deadlock,
+            detected_deadlock=h_res.timed_out,
+            elapsed_sec=h_res.elapsed_sec,
+            exit_code=h_res.exit_code,
+            timed_out=h_res.timed_out,
+            observer_mode="observed_workload",
+            stdout=h_res.stdout,
+            stderr=h_res.stderr,
+        )
+
     def run_all(self) -> BenchmarkSuiteResult:
         """Executes all registered workloads, computes metrics, and exports reports."""
         all_runs: List[WorkloadRunResult] = []
+        baseline_times: List[float] = []
 
         for item in self._workloads:
             w_type = item["type"]
@@ -259,8 +344,10 @@ class BenchmarkRunner:
 
             elif w_type == "binary":
                 bin_path = item["path"]
-                harness = WorkloadHarness(timeout_sec=item.get("timeout_sec", 3.0))
+                timeout_sec = item.get("timeout_sec", 3.0)
+                harness = WorkloadHarness(timeout_sec=timeout_sec)
                 for i in range(runs):
+                    # 1. Unobserved baseline
                     h_res = harness.run_command([str(bin_path)])
                     run_res = WorkloadRunResult(
                         workload_name=name,
@@ -270,13 +357,24 @@ class BenchmarkRunner:
                         elapsed_sec=h_res.elapsed_sec,
                         exit_code=h_res.exit_code,
                         timed_out=h_res.timed_out,
-                        observer_mode="baseline_timeout",
+                        observer_mode="unobserved_baseline",
                         stdout=h_res.stdout,
                         stderr=h_res.stderr,
                     )
                     all_runs.append(run_res)
+                    baseline_times.append(h_res.elapsed_sec)
 
-        metrics = compute_metrics(all_runs)
+                    # 2. Observed workload
+                    obs_res = self.evaluate_live_binary(
+                        bin_path=bin_path,
+                        workload_name=name,
+                        expected_deadlock=expected,
+                        run_index=i,
+                        timeout_sec=timeout_sec,
+                    )
+                    all_runs.append(obs_res)
+
+        metrics = compute_metrics(all_runs, baseline_times=baseline_times if baseline_times else None)
 
         # Export all 3 artifacts specified in Section 5
         export_csv(all_runs, self.output_dir / "raw_runs.csv")

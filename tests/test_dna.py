@@ -1,4 +1,4 @@
-﻿"""
+"""
 tests/test_dna.py — Unit tests for Deadlock DNA Fingerprinting & History Store (Feature B)
 """
 
@@ -25,17 +25,22 @@ class TestCanonicalization:
         assert len(canon.edges) == 4
 
     def test_different_tids_produce_same_canonical_pattern(self):
-        """Cycles with different TIDs, PIDs, and addresses produce identical canonical forms."""
+        """Cycles with different TIDs, PIDs for the same bug produce identical serializations, while distinct offsets differ."""
         run1 = ["M@5000:0x1111", "T1001", "M@5000:0x2222", "T1002", "M@5000:0x1111"]
-        run2 = ["M@9000:0xaaaa", "T8001", "M@9000:0xbbbb", "T8002", "M@9000:0xaaaa"]
+        run2 = ["M@9000:0x1111", "T8001", "M@9000:0x2222", "T8002", "M@9000:0x1111"]
+        run3 = ["M@9000:0xaaaa", "T8001", "M@9000:0xbbbb", "T8002", "M@9000:0xaaaa"]
 
         c1 = canonicalize(run1)
         c2 = canonicalize(run2)
+        c3 = canonicalize(run3)
 
-        assert c1.pattern == c2.pattern
-        assert c1.nodes == c2.nodes
-        assert c1.edges == c2.edges
+        assert c1.pattern == c2.pattern == c3.pattern
+        assert c1.nodes == c2.nodes == c3.nodes
+        assert c1.edges == c2.edges == c3.edges
+        # Same bug across runs shares serialization
         assert c1.serialize() == c2.serialize()
+        # Different bug locations produce distinct serializations
+        assert c1.serialize() != c3.serialize()
 
     def test_different_rotations_produce_same_canonical_pattern(self):
         """Rotating starting position produces identical canonical representation."""
@@ -94,14 +99,17 @@ class TestFingerprinting:
         assert int(fp, 16) >= 0
 
     def test_equivalent_cycles_share_fingerprint(self):
-        """Different runs of equivalent deadlocks yield exact same fingerprint."""
+        """Different runs of equivalent deadlocks yield exact same fingerprint, while distinct offsets differ."""
         run1 = ["M@100:0x1000", "T1", "M@100:0x2000", "T2", "M@100:0x1000"]
-        run2 = ["M@200:0xbeef", "T9", "M@200:0xdead", "T8", "M@200:0xbeef"]
+        run2 = ["M@200:0x1000", "T9", "M@200:0x2000", "T8", "M@200:0x1000"]
+        run_distinct = ["M@200:0xbeef", "T9", "M@200:0xdead", "T8", "M@200:0xbeef"]
 
         fp1, _ = fingerprint_cycle(run1)
         fp2, _ = fingerprint_cycle(run2)
+        fp_distinct, _ = fingerprint_cycle(run_distinct)
 
         assert fp1 == fp2
+        assert fp1 != fp_distinct
 
     def test_different_cycles_produce_different_fingerprints(self):
         """2-way and 3-way deadlocks produce distinct fingerprints."""
@@ -137,8 +145,8 @@ class TestDeadlockStore:
         assert store.count_fingerprints() == 1
         assert store.count_detections() == 1
 
-        # 2nd detection of same pattern (different runtime TIDs)
-        cycle2 = ["M@2:0xaa", "T10", "M@2:0xbb", "T20", "M@2:0xaa"]
+        # 2nd detection of same pattern (different runtime TIDs, same bug location)
+        cycle2 = ["M@2:0x10", "T10", "M@2:0x20", "T20", "M@2:0x10"]
         fp2, canon2 = fingerprint_cycle(cycle2)
         assert fp1 == fp2
 
@@ -148,13 +156,29 @@ class TestDeadlockStore:
             detected_at_ns=2_000_000,
             pid=2,
             tids=[10, 20],
-            resources=["M@2:0xaa", "M@2:0xbb"],
+            resources=["M@2:0x10", "M@2:0x20"],
             confidence="complete",
         )
         assert count2 == 2
         # Still only 1 distinct fingerprint
         assert store.count_fingerprints() == 1
         assert store.count_detections() == 2
+
+        # 3rd detection of a DIFFERENT deadlock bug (distinct binary offsets)
+        cycle_diff = ["M@3:0xaa", "T30", "M@3:0xbb", "T40", "M@3:0xaa"]
+        fp_diff, canon_diff = fingerprint_cycle(cycle_diff)
+        assert fp1 != fp_diff
+        count_diff = store.record(
+            fingerprint=fp_diff,
+            canonical_pattern=canon_diff.pattern,
+            detected_at_ns=3_000_000,
+            pid=3,
+            tids=[30, 40],
+            resources=["M@3:0xaa", "M@3:0xbb"],
+        )
+        assert count_diff == 1
+        assert store.count_fingerprints() == 2
+        assert store.count_detections() == 3
 
         # Verify summary row
         fp_row = store.get_fingerprint(fp1)

@@ -1,13 +1,13 @@
-﻿"""
+"""
 dna/fingerprint.py — Deadlock DNA Fingerprinting (Feature B)
 
 Computes deterministic SHA-256 fingerprints from canonical cycle representations
-as specified in Section 4 of the Feature Expansion Specification.
+and static binary offsets as specified in Section 4 of the Feature Expansion Specification.
 """
 
 import hashlib
 import json
-from typing import List, Tuple, Union, Dict, Any
+from typing import List, Tuple, Union, Dict, Any, Optional
 
 from .canonicalizer import CanonicalCycle, canonicalize
 
@@ -36,23 +36,40 @@ def compute_fingerprint(canonical_payload: Union[CanonicalCycle, Dict[str, Any]]
     return hashlib.sha256(encoded).hexdigest()
 
 
-def fingerprint_cycle(cycle: List[str]) -> Tuple[str, CanonicalCycle]:
+def fingerprint_cycle(
+    cycle: List[str],
+    offsets: Optional[Dict[str, Optional[int]]] = None,
+    resolver: Optional[Any] = None,
+    pid: Optional[int] = None,
+) -> Tuple[str, CanonicalCycle]:
     """
     Convenience helper: canonicalizes a cycle and returns its SHA-256 fingerprint.
+    Integrates static binary offsets to distinguish topologically identical bugs.
 
     Args:
         cycle: List of cycle node names.
+        offsets: Optional dictionary mapping resource names to integer binary offsets.
+        resolver: Optional SymbolResolver to query static offsets if offsets is not passed.
+        pid: Optional process PID for symbol resolution.
 
     Returns:
         Tuple of (sha256_fingerprint, canonical_cycle).
-
-    Notes:
-        If canonicalization raises (e.g. malformed cycle that best_effort cannot handle),
-        falls back to a simple SHA-256 of the sorted-joined cycle node strings.
-        The returned CanonicalCycle in that case is a minimal stub with just a pattern.
     """
+    effective_offsets = dict(offsets) if offsets else {}
+    if resolver and not offsets:
+        for node in cycle:
+            if not node.startswith("T"):
+                if hasattr(resolver, "get_static_offset"):
+                    off = resolver.get_static_offset(node, pid)
+                    if off is not None:
+                        effective_offsets[node] = off
+
     try:
-        canon = canonicalize(cycle, best_effort=True)
+        canon = canonicalize(
+            cycle,
+            best_effort=True,
+            offsets=effective_offsets if effective_offsets else None,
+        )
         fp = compute_fingerprint(canon)
         return fp, canon
     except Exception:
@@ -67,5 +84,6 @@ def fingerprint_cycle(cycle: List[str]) -> Tuple[str, CanonicalCycle]:
             edges=(),
             thread_count=0,
             resource_count=0,
+            resource_offsets=(),
         )
         return fp, stub

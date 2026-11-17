@@ -131,11 +131,16 @@ def compute_metrics(
     lat_stats = compute_latency_stats(latencies)
 
     observed_times = [
-        r.elapsed_sec for r in runs if r.elapsed_sec is not None and r.elapsed_sec > 0
+        r.elapsed_sec for r in runs
+        if r.elapsed_sec is not None and r.elapsed_sec > 0
+        and getattr(r, "observer_mode", "") not in ("unobserved_baseline", "baseline")
     ]
+    if not observed_times and baseline_times:
+        observed_times = [r.elapsed_sec for r in runs if r.elapsed_sec is not None and r.elapsed_sec > 0]
+
     overhead = (
         compute_overhead_percent(baseline_times, observed_times)
-        if baseline_times
+        if baseline_times and observed_times
         else None
     )
 

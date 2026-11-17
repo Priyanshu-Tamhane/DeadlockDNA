@@ -4,6 +4,7 @@ diagnosis/symbol_resolver.py — Source-Code & Symbol Resolution (Upgrade 1)
 Translates raw virtual memory addresses (e.g. 0x7ffd1234, M@5000:0x1000)
 and thread IDs into human-readable source code locations, line numbers,
 function names, and variable names (e.g. 'L1' at 'targets/test_2way.c:24').
+Caches symbols eagerly at process attach to prevent per-frame subprocess spawning.
 """
 
 from dataclasses import dataclass
@@ -12,7 +13,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ class SymbolResolver:
         self._cache: Dict[str, SymbolInfo] = {}
         self._binary_symbols: Dict[str, Dict[int, str]] = {} # binary_path -> {offset: name}
         self._proc_base_cache: Dict[int, Tuple[int, str]] = {} # pid -> (base_addr, exe_path)
+        self._attached_pids: Set[int] = set()
 
         # Preload known synthetic test targets for instant offline / test replay resolution
         self._known_fallbacks: Dict[str, Dict[str, SymbolInfo]] = {
@@ -89,9 +91,84 @@ class SymbolResolver:
             }
         }
 
-    def resolve_resource(self, raw_resource: str, pid: Optional[int] = None) -> SymbolInfo:
+    def attach_process(self, pid: int, target_path: Optional[str] = None) -> None:
+        """
+        Eagerly loads process memory maps and binary symbol tables when attaching to a PID.
+        Eliminates lazily spawning subprocesses inside the UI render loop.
+        """
+        if not pid or pid in self._attached_pids:
+            return
+
+        self._attached_pids.add(pid)
+        base_addr, exe_path = self._get_proc_base(pid)
+        if not exe_path and target_path:
+            exe_path = target_path
+            self._proc_base_cache[pid] = (base_addr, exe_path)
+
+        if exe_path:
+            self._lookup_nm_symbol(exe_path, -1)  # Pre-loads the full nm table into self._binary_symbols
+            logger.info("Eagerly attached symbol resolver to PID %d (exe: %s, base: 0x%x)", pid, exe_path, base_addr)
+
+    def get_static_offset(self, raw_resource: str, pid: Optional[int] = None) -> Optional[int]:
+        """
+        Extracts static binary offset for a resource (rel_offset from base address).
+        """
+        clean_addr = raw_resource
+        clean_pid = pid
+        if clean_addr.startswith(("M@", "S@")):
+            parts = clean_addr[2:].split(":", 1)
+            if len(parts) == 2:
+                try:
+                    clean_pid = int(parts[0])
+                except ValueError:
+                    pass
+                clean_addr = parts[1]
+
+        # If it's a known fallback, parse the offset
+        target_key = self._guess_target_key(clean_pid)
+        if target_key and target_key in self._known_fallbacks:
+            fb_map = self._known_fallbacks[target_key]
+            if clean_addr in fb_map:
+                try:
+                    return int(clean_addr, 16)
+                except ValueError:
+                    pass
+            suffix_4 = "0x" + clean_addr[-4:].lower()
+            if suffix_4 in fb_map:
+                try:
+                    return int(suffix_4, 16)
+                except ValueError:
+                    pass
+
+        # Check ASLR base translation
+        if clean_pid and clean_pid in self._proc_base_cache:
+            base_addr, _ = self._proc_base_cache[clean_pid]
+            if base_addr > 0:
+                try:
+                    addr_int = int(clean_addr, 16) if clean_addr.startswith("0x") else int(clean_addr)
+                    rel = addr_int - base_addr
+                    if rel >= 0:
+                        return rel
+                except ValueError:
+                    pass
+
+        if clean_addr.startswith(("0x", "0X")):
+            try:
+                return int(clean_addr, 16)
+            except ValueError:
+                pass
+        return None
+
+    def resolve_resource(
+        self,
+        raw_resource: str,
+        pid: Optional[int] = None,
+        allow_subprocesses: bool = True,
+    ) -> SymbolInfo:
         """
         Resolves a resource node (e.g. 'M@5000:0x7ffd4040' or '0x1000') to a SymbolInfo.
+        When allow_subprocesses is False (e.g. during UI frame updates), uses only
+        pre-cached or in-memory tables without spawning subprocesses.
         """
         cache_key = f"{pid}:{raw_resource}"
         if cache_key in self._cache:
@@ -113,25 +190,39 @@ class SymbolResolver:
         target_key = self._guess_target_key(clean_pid)
         if target_key and target_key in self._known_fallbacks:
             fb_map = self._known_fallbacks[target_key]
-            # Match exact or trailing offset
             if clean_addr in fb_map:
                 res = fb_map[clean_addr]
                 self._cache[cache_key] = res
                 return res
-            # Check 4-digit hex suffix (e.g. 0x...4040 -> 0x4040)
             suffix_4 = "0x" + clean_addr[-4:].lower()
             if suffix_4 in fb_map:
                 res = fb_map[suffix_4]
                 self._cache[cache_key] = res
                 return res
 
-        # Attempt dynamic /proc/<pid>/maps and nm/addr2line resolution
-        info = self._resolve_from_proc_maps(clean_pid, clean_addr)
-        if info:
-            self._cache[cache_key] = info
-            return info
+        # In-memory resolution if base and symbols are already cached
+        if clean_pid and clean_pid in self._proc_base_cache:
+            base_addr, exe_path = self._proc_base_cache[clean_pid]
+            if base_addr and exe_path and exe_path in self._binary_symbols:
+                try:
+                    addr_int = int(clean_addr, 16) if clean_addr.startswith("0x") else int(clean_addr)
+                    rel_offset = addr_int - base_addr
+                    table = self._binary_symbols[exe_path]
+                    if rel_offset in table:
+                        info = SymbolInfo(name=table[rel_offset])
+                        self._cache[cache_key] = info
+                        return info
+                except ValueError:
+                    pass
 
-        # If unresolved, generate a clean scoped fallback
+        # If subprocesses allowed, run full /proc/<pid>/maps and nm/addr2line
+        if allow_subprocesses:
+            info = self._resolve_from_proc_maps(clean_pid, clean_addr)
+            if info:
+                self._cache[cache_key] = info
+                return info
+
+        # Fallback: fast formatted identifier without subprocess spawning
         fallback = SymbolInfo(name=f"mutex_{clean_addr}")
         self._cache[cache_key] = fallback
         return fallback
@@ -140,7 +231,6 @@ class SymbolResolver:
         """Returns the function name executed by the thread if known."""
         target_key = self._guess_target_key(pid)
         if target_key == "test_2way":
-            # In test_2way, first thread runs thread1, second runs thread2
             return "thread1" if (tid % 2 != 0) else "thread2"
         if target_key == "test_3way":
             rem = tid % 3
@@ -166,7 +256,6 @@ class SymbolResolver:
             if "test_3way" in exe: return "test_3way"
             if "test_semaphore" in exe: return "test_semaphore"
 
-        # Check /proc/<pid>/exe link if available
         if pid:
             try:
                 exe_link = Path(f"/proc/{pid}/exe")
@@ -180,7 +269,6 @@ class SymbolResolver:
             except OSError:
                 pass
 
-        # Fallback to test_2way for generic tests / sample files
         return "test_2way"
 
     def _resolve_from_proc_maps(self, pid: Optional[int], addr_str: str) -> Optional[SymbolInfo]:
@@ -193,7 +281,6 @@ class SymbolResolver:
         except ValueError:
             return None
 
-        # Discover executable base address and binary path
         base_addr, exe_path = self._get_proc_base(pid)
         if not base_addr or not exe_path:
             return None
@@ -203,12 +290,10 @@ class SymbolResolver:
         except OSError:
             return None
 
-        # Check if address is within binary offset
         rel_offset = addr_int - base_addr
         if rel_offset < 0:
             return None
 
-        # Lookup symbol via 'nm'
         sym_name = self._lookup_nm_symbol(exe_path, rel_offset)
         file_loc, line_no = self._lookup_addr2line(exe_path, rel_offset)
 
@@ -274,7 +359,7 @@ class SymbolResolver:
             except Exception:
                 self._binary_symbols[binary_path] = {}
 
-        table = self._binary_symbols[binary_path]
+        table = self._binary_symbols.get(binary_path, {})
         return table.get(offset)
 
     def _lookup_addr2line(self, binary_path: str, offset: int) -> Tuple[Optional[str], Optional[int]]:

@@ -1,30 +1,51 @@
-﻿"""
+"""
 dna/canonicalizer.py — Deadlock DNA Canonicalization (Feature B)
 
 Transforms runtime cycle topologies with arbitrary PIDs, TIDs, and memory addresses
 into deterministic, role-based canonical representations adhering to Section 4 of
-the Feature Expansion Specification.
+the Feature Expansion Specification, augmented with static binary offsets to distinguish
+topologically identical deadlocks.
 """
 
 from dataclasses import dataclass, field
 import json
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
+
+
+def extract_resource_offset(res_str: str) -> Optional[int]:
+    """
+    Extracts numerical offset from resource string (e.g. 'M@5000:0x1000' -> 0x1000).
+    Returns None if no hex offset is embedded.
+    """
+    clean = res_str
+    if clean.startswith(("M@", "S@")):
+        parts = clean[2:].split(":", 1)
+        if len(parts) == 2:
+            clean = parts[1]
+    if clean.startswith(("0x", "0X")):
+        try:
+            return int(clean, 16)
+        except ValueError:
+            return None
+    return None
 
 
 @dataclass(frozen=True)
 class CanonicalCycle:
     """
     Normalized, role-based representation of a deadlock cycle.
-    Independent of runtime PIDs, TIDs, and virtual memory addresses.
+    Independent of runtime PIDs and TIDs, preserving static binary offsets
+    to distinguish distinct bug locations.
     """
     pattern: str                            # e.g. "THREAD_0 -> RESOURCE_0 -> THREAD_1 -> RESOURCE_1 -> THREAD_0"
     nodes: Tuple[str, ...]                  # ("THREAD_0", "RESOURCE_0", "THREAD_1", "RESOURCE_1")
     edges: Tuple[Tuple[str, str, str], ...] # (("THREAD_0", "REQUEST", "RESOURCE_0"), ...)
     thread_count: int
     resource_count: int
+    resource_offsets: Tuple[Optional[int], ...] = ()
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d: Dict[str, Any] = {
             "pattern": self.pattern,
             "nodes": list(self.nodes),
             "edges": [
@@ -34,19 +55,24 @@ class CanonicalCycle:
             "thread_count": self.thread_count,
             "resource_count": self.resource_count,
         }
+        if any(off is not None for off in self.resource_offsets):
+            d["resource_offsets"] = [
+                f"0x{off:x}" if off is not None else None
+                for off in self.resource_offsets
+            ]
+        return d
 
     def serialize(self) -> str:
         """Deterministic UTF-8 JSON serialization for hashing."""
         return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
 
 
-def _best_effort_canonicalize(nodes: List[str]) -> CanonicalCycle:
+def _best_effort_canonicalize(
+    nodes: List[str],
+    offsets: Optional[Dict[str, Optional[int]]] = None,
+) -> CanonicalCycle:
     """
     Best-effort canonicalization for degenerate (non-bipartite) cycles.
-
-    Sorts thread nodes and resource nodes independently, assigns labels in sorted
-    order, and builds a CanonicalCycle. Used for partially-built RAG cycles that
-    fail strict bipartite validation.
     """
     thread_nodes = sorted(n for n in nodes if n.startswith("T"))
     resource_nodes = sorted(n for n in nodes if not n.startswith("T"))
@@ -69,31 +95,38 @@ def _best_effort_canonicalize(nodes: List[str]) -> CanonicalCycle:
 
     pattern_str = " -> ".join(canonical_nodes + [canonical_nodes[0]]) if canonical_nodes else ""
 
+    res_offsets: List[Optional[int]] = []
+    for r in resource_nodes:
+        if offsets and r in offsets:
+            res_offsets.append(offsets[r])
+        else:
+            res_offsets.append(extract_resource_offset(r))
+
     return CanonicalCycle(
         pattern=pattern_str,
         nodes=tuple(canonical_nodes),
         edges=tuple(canonical_edges),
         thread_count=len(thread_nodes),
         resource_count=len(resource_nodes),
+        resource_offsets=tuple(res_offsets),
     )
 
 
-def canonicalize(cycle: List[str], best_effort: bool = False) -> CanonicalCycle:
+def canonicalize(
+    cycle: List[str],
+    best_effort: bool = False,
+    offsets: Optional[Dict[str, Optional[int]]] = None,
+) -> CanonicalCycle:
     """
     Canonicalizes a directed cycle from the Resource Allocation Graph.
 
     Args:
-        cycle: List of cycle node names (e.g. ['M@5000:0x1000', 'T5001', 'M@5000:0x2000', 'T5002', 'M@5000:0x1000']).
-        best_effort: When True, non-bipartite or degenerate cycles that would normally raise
-            ValueError are handled with a best-effort canonicalization: thread and resource nodes
-            are sorted independently, labeled in sorted order, and a CanonicalCycle is returned.
-            This handles degenerate cycles from partially-built RAGs.
+        cycle: List of cycle node names.
+        best_effort: When True, handles degenerate or partially-built cycles gracefully.
+        offsets: Optional mapping of resource node names to static binary offsets.
 
     Returns:
         CanonicalCycle: Deterministic, normalized cycle representation.
-
-    Raises:
-        ValueError: If cycle is malformed or not a closed bipartite cycle (and best_effort=False).
     """
     if not cycle or len(cycle) < 4:
         raise ValueError(f"Cycle must have at least 4 nodes (2 threads, 2 resources), got: {cycle}")
@@ -104,7 +137,7 @@ def canonicalize(cycle: List[str], best_effort: bool = False) -> CanonicalCycle:
 
     if num_nodes % 2 != 0:
         if best_effort:
-            return _best_effort_canonicalize(nodes)
+            return _best_effort_canonicalize(nodes, offsets=offsets)
         raise ValueError(f"Bipartite deadlock cycle must have an even number of nodes, got {num_nodes}: {nodes}")
 
     # Validate alternating bipartite structure
@@ -113,7 +146,7 @@ def canonicalize(cycle: List[str], best_effort: bool = False) -> CanonicalCycle:
         next_is_thread = nodes[(i + 1) % num_nodes].startswith("T")
         if curr_is_thread == next_is_thread:
             if best_effort:
-                return _best_effort_canonicalize(nodes)
+                return _best_effort_canonicalize(nodes, offsets=offsets)
             raise ValueError(
                 f"Cycle must strictly alternate between threads (T) and resources (M@). "
                 f"Violation at index {i}: '{nodes[i]}' -> '{nodes[(i + 1) % num_nodes]}'"
@@ -125,7 +158,7 @@ def canonicalize(cycle: List[str], best_effort: bool = False) -> CanonicalCycle:
 
     if num_threads < 2 or num_resources < 2:
         if best_effort:
-            return _best_effort_canonicalize(nodes)
+            return _best_effort_canonicalize(nodes, offsets=offsets)
         raise ValueError(f"Cycle must contain at least 2 threads and 2 resources, got: {nodes}")
 
     candidates: List[Tuple[str, CanonicalCycle]] = []
@@ -141,6 +174,8 @@ def canonicalize(cycle: List[str], best_effort: bool = False) -> CanonicalCycle:
         r_counter = 0
 
         canonical_nodes: List[str] = []
+        candidate_offsets: List[Optional[int]] = []
+
         for n in rotated:
             if n.startswith("T"):
                 if n not in thread_map:
@@ -151,11 +186,13 @@ def canonicalize(cycle: List[str], best_effort: bool = False) -> CanonicalCycle:
                 if n not in res_map:
                     res_map[n] = f"RESOURCE_{r_counter}"
                     r_counter += 1
+                    if offsets and n in offsets:
+                        candidate_offsets.append(offsets[n])
+                    else:
+                        candidate_offsets.append(extract_resource_offset(n))
                 canonical_nodes.append(res_map[n])
 
         # Form semantic edges:
-        # THREAD -> RESOURCE is REQUEST
-        # RESOURCE -> THREAD is ALLOCATION
         canonical_edges: List[Tuple[str, str, str]] = []
         for i in range(num_nodes):
             src = canonical_nodes[i]
@@ -174,6 +211,7 @@ def canonicalize(cycle: List[str], best_effort: bool = False) -> CanonicalCycle:
             edges=tuple(canonical_edges),
             thread_count=num_threads,
             resource_count=num_resources,
+            resource_offsets=tuple(candidate_offsets),
         )
 
         serialized = candidate.serialize()

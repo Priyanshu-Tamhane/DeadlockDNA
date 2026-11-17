@@ -48,6 +48,8 @@ class Dashboard:
         self._t0 = time.time()
         self._n_events = 0
         self._deadlock_alert_shown = False
+        self._last_ui_push = 0.0
+        self._last_console_push = 0.0
 
     @contextmanager
     def live_context(self) -> Generator["Dashboard", None, None]:
@@ -88,14 +90,23 @@ class Dashboard:
                 if shutil.which("wslview"):
                     subprocess.Popen(["wslview", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     return
-                # 2. Try launching Windows default browser via PowerShell
-                if shutil.which("powershell.exe"):
-                    subprocess.Popen(
-                        ["powershell.exe", "-NoProfile", "-Command", f"Start-Process '{url}'"],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                    return
+                # 2. Try launching Windows default browser via PowerShell / cmd (even under sudo where /mnt/c is not in PATH)
+                ps_candidates = [
+                    shutil.which("powershell.exe"),
+                    "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+                    "/mnt/c/Windows/System32/cmd.exe",
+                ]
+                for ps in ps_candidates:
+                    if ps and Path(ps).exists():
+                        if "cmd.exe" in str(ps):
+                            subprocess.Popen([str(ps), "/c", "start", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        else:
+                            subprocess.Popen(
+                                [str(ps), "-NoProfile", "-Command", f"Start-Process '{url}'"],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                            )
+                        return
 
             # Native fallback (Linux/macOS/Windows)
             webbrowser.open(url)
@@ -108,6 +119,7 @@ class Dashboard:
         rag: ResourceAllocationGraph,
         deadlocks: Optional[List[DeadlockResult]] = None,
         risks: Optional[List[Any]] = None,
+        force: bool = False,
     ) -> None:
         """Pushes state updates to the web dashboard and logs to console."""
         self._n_events += 1
@@ -127,6 +139,15 @@ class Dashboard:
         if risks is not None:
             self._risks = risks
 
+        now = time.time()
+        is_dl = bool(self._deadlocks)
+        dl_status_changed = (is_dl != self._deadlock_alert_shown)
+        should_push_ui = force or dl_status_changed or (now - self._last_ui_push >= 0.05)
+        should_push_console = force or dl_status_changed or (now - self._last_console_push >= 0.1)
+
+        if not should_push_ui and not should_push_console:
+            return
+
         # Extract RAG nodes and edges with rich source symbols (Upgrade 1)
         g = rag.get_graph()
         resolver = getattr(self, "_resolver", None)
@@ -134,6 +155,10 @@ class Dashboard:
             from diagnosis.symbol_resolver import SymbolResolver
             self._resolver = SymbolResolver(target_hint=self.target_name)
             resolver = self._resolver
+            if self.pid:
+                resolver.attach_process(self.pid)
+        elif self.pid and hasattr(resolver, "_attached_pids") and self.pid not in resolver._attached_pids:
+            resolver.attach_process(self.pid)
 
         nodes = []
         for n in g.nodes():
@@ -147,7 +172,7 @@ class Dashboard:
                     "function": func_name,
                 })
             else:
-                sym = resolver.resolve_resource(n, self.pid or event.pid)
+                sym = resolver.resolve_resource(n, self.pid or event.pid, allow_subprocesses=False)
                 nodes.append({
                     "id": n,
                     "label": sym.display_str,
@@ -164,80 +189,105 @@ class Dashboard:
                 "inferred": data.get("inferred", False),
             })
 
-        # Serialize deadlocks
-        serialized_dls = []
-        for dl in self._deadlocks:
-            dl_dict = {
-                "detected": dl.detected,
-                "cycle": dl.cycle,
-                "threads": dl.threads,
-                "resources": dl.resources,
-                "latency_us": dl.latency_us,
-                "fingerprint": dl.fingerprint,
-                "canonical_pattern": dl.canonical_pattern,
-                "occurrence_count": dl.occurrence_count,
-                "diagnosis": None,
-                "recovery_plan": None,
+        if should_push_ui:
+            self._last_ui_push = now
+            # Serialize deadlocks
+            serialized_dls = []
+            for dl in self._deadlocks:
+                dl_dict = {
+                    "detected": dl.detected,
+                    "cycle": dl.cycle,
+                    "threads": dl.threads,
+                    "resources": dl.resources,
+                    "latency_us": dl.latency_us,
+                    "fingerprint": dl.fingerprint,
+                    "canonical_pattern": dl.canonical_pattern,
+                    "occurrence_count": dl.occurrence_count,
+                    "diagnosis": None,
+                    "recovery_plan": None,
+                }
+                if dl.diagnosis:
+                    if hasattr(dl.diagnosis, "to_dict"):
+                        dl_dict["diagnosis"] = dl.diagnosis.to_dict()
+                    else:
+                        dl_dict["diagnosis"] = {
+                            "summary": str(dl.diagnosis),
+                            "confidence": "complete",
+                            "steps": [],
+                        }
+                if dl.recovery_plan:
+                    if hasattr(dl.recovery_plan, "to_dict"):
+                        dl_dict["recovery_plan"] = dl.recovery_plan.to_dict()
+                    else:
+                        dl_dict["recovery_plan"] = str(dl.recovery_plan)
+
+                serialized_dls.append(dl_dict)
+
+            # Serialize risks
+            serialized_risks = [r.to_dict() if hasattr(r, "to_dict") else str(r) for r in self._risks]
+
+            # Dispatch snapshot to Web UI
+            snapshot = {
+                "status": "DEADLOCK DETECTED" if self._deadlocks else "MONITORING",
+                "target_name": self.target_name,
+                "pid": self.pid or event.pid,
+                "nodes": nodes,
+                "edges": edges,
+                "deadlocks": serialized_dls,
+                "risks": serialized_risks,
+                "recent_events": list(self._events),
+                "total_events": self._n_events,
+                "uptime_sec": uptime_sec,
+                "last_updated": time.time(),
             }
-            if dl.diagnosis:
-                if hasattr(dl.diagnosis, "to_dict"):
-                    dl_dict["diagnosis"] = dl.diagnosis.to_dict()
-                else:
-                    dl_dict["diagnosis"] = {
-                        "summary": str(dl.diagnosis),
-                        "confidence": "complete",
-                        "steps": [],
-                    }
-            if dl.recovery_plan:
-                if hasattr(dl.recovery_plan, "to_dict"):
-                    dl_dict["recovery_plan"] = dl.recovery_plan.to_dict()
-                else:
-                    dl_dict["recovery_plan"] = str(dl.recovery_plan)
 
-            serialized_dls.append(dl_dict)
+            if self._server:
+                self._server.state_store.update(snapshot)
 
-        # Serialize risks
-        serialized_risks = [r.to_dict() if hasattr(r, "to_dict") else str(r) for r in self._risks]
+        if should_push_console:
+            self._last_console_push = now
+            op_name = event.operation.name
+            n_threads = len([n for n in nodes if n["id"].startswith("T")])
+            n_mutexes = len([n for n in nodes if n["id"].startswith("M@")])
 
-        # Dispatch snapshot to Web UI
-        snapshot = {
-            "status": "DEADLOCK DETECTED" if self._deadlocks else "MONITORING",
-            "target_name": self.target_name,
-            "pid": self.pid or event.pid,
-            "nodes": nodes,
-            "edges": edges,
-            "deadlocks": serialized_dls,
-            "risks": serialized_risks,
-            "recent_events": list(self._events),
-            "total_events": self._n_events,
-            "uptime_sec": uptime_sec,
-            "last_updated": time.time(),
-        }
+            if self._deadlocks and not self._deadlock_alert_shown:
+                self._deadlock_alert_shown = True
+                dl = self._deadlocks[0]
+                cycle_str = " ➔ ".join(dl.cycle)
+                print(f"\n[deadlockdna] 🚨 DEADLOCK DETECTED! Cycle: {cycle_str}", file=sys.stderr)
+                if dl.fingerprint:
+                    print(f"[deadlockdna]    DNA Fingerprint: {dl.fingerprint} (seen {dl.occurrence_count}x)", file=sys.stderr)
+                if dl.diagnosis:
+                    print(f"[deadlockdna]    Diagnosis: {dl.diagnosis.summary}", file=sys.stderr)
+                print(f"[deadlockdna]    Interactive view at: http://127.0.0.1:{self.port}\n", file=sys.stderr)
+            elif not self._deadlocks and self._deadlock_alert_shown:
+                self._deadlock_alert_shown = False
+                print("\n[deadlockdna] ✅ Deadlock cycle resolved.\n", file=sys.stderr)
+            else:
+                sys.stderr.write(
+                    f"\r[deadlockdna] Event #{self._n_events:<6} | {op_name:<13} T{event.tid} ➔ {event.resource} "
+                    f"| RAG: {n_threads} threads, {n_mutexes} locks | http://127.0.0.1:{self.port}"
+                )
+                sys.stderr.flush()
 
-        if self._server:
-            self._server.state_store.update(snapshot)
-
-        # Compact console progress output
-        op_name = event.operation.name
-        n_threads = len([n for n in nodes if n["id"].startswith("T")])
-        n_mutexes = len([n for n in nodes if n["id"].startswith("M@")])
-
-        if self._deadlocks and not self._deadlock_alert_shown:
-            self._deadlock_alert_shown = True
-            dl = self._deadlocks[0]
-            cycle_str = " ➔ ".join(dl.cycle)
-            print(f"\n[deadlockdna] 🚨 DEADLOCK DETECTED! Cycle: {cycle_str}", file=sys.stderr)
-            if dl.fingerprint:
-                print(f"[deadlockdna]    DNA Fingerprint: {dl.fingerprint} (seen {dl.occurrence_count}x)", file=sys.stderr)
-            if dl.diagnosis:
-                print(f"[deadlockdna]    Diagnosis: {dl.diagnosis.summary}", file=sys.stderr)
-            print(f"[deadlockdna]    Interactive view at: http://127.0.0.1:{self.port}\n", file=sys.stderr)
-        elif not self._deadlocks and self._deadlock_alert_shown:
-            self._deadlock_alert_shown = False
-            print("\n[deadlockdna] ✅ Deadlock cycle resolved.\n", file=sys.stderr)
-        else:
-            sys.stderr.write(
-                f"\r[deadlockdna] Event #{self._n_events:<4} | {op_name:<13} T{event.tid} ➔ {event.resource} "
-                f"| RAG: {n_threads} threads, {n_mutexes} locks | http://127.0.0.1:{self.port}"
+    def flush(
+        self,
+        rag: ResourceAllocationGraph,
+        deadlocks: Optional[List[DeadlockResult]] = None,
+        risks: Optional[List[Any]] = None,
+    ) -> None:
+        """Forces an immediate final state update to web dashboard and console."""
+        if self._events:
+            last_ev = self._events[-1]
+            from graph.models import Event as GraphEvent, Operation
+            op = getattr(Operation, last_ev["operation"], Operation.LOCK_ACQUIRED)
+            dummy_ev = GraphEvent(
+                timestamp_ns=last_ev["timestamp_ns"],
+                pid=last_ev["pid"],
+                tid=last_ev["tid"],
+                operation=op,
+                resource=last_ev["resource"],
             )
+            self.update(dummy_ev, rag, deadlocks, risks, force=True)
+            sys.stderr.write("\n")
             sys.stderr.flush()

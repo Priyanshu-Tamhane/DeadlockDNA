@@ -1,4 +1,4 @@
-﻿"""
+"""
 rag.py — Resource Allocation Graph Engine (graph/)
 
 Maintains a live directed graph of thread-resource relationships.
@@ -27,10 +27,12 @@ _REQUEST_EDGE_TTL_NS = 30_000_000_000  # 30 seconds — prune stale request edge
 
 
 class ResourceAllocationGraph:
-    def __init__(self) -> None:
+    def __init__(self, prune_interval: int = 50) -> None:
         self._g: nx.DiGraph = nx.DiGraph()
         self._holder: dict[str, str] = {}   # resource_node → thread_node
         self.last_event_ts_ns: int = 0
+        self._prune_interval: int = prune_interval
+        self._events_since_prune: int = 0
 
     # ── Public ────────────────────────────────────────────────────────────
 
@@ -109,7 +111,9 @@ class ResourceAllocationGraph:
                          timestamp_ns=ts_ns, source="pthread_mutex_lock")
         self._holder[r] = t
         logger.debug("RAG +alloc    %s → %s", r, t)
-        self._prune()
+        self._events_since_prune += 1
+        if self._events_since_prune >= self._prune_interval:
+            self._prune()
 
     def _released(self, t: str, r: str, ts_ns: Optional[int] = None) -> None:
         """Thread T released resource R.  Remove allocation edge R→T."""
@@ -118,9 +122,17 @@ class ResourceAllocationGraph:
             logger.debug("RAG -alloc    %s → %s (released)", r, t)
         if self._holder.get(r) == t:
             del self._holder[r]
-        self._prune()
+        self._events_since_prune += 1
+        if self._events_since_prune >= self._prune_interval:
+            self._prune()
+
+    def prune(self, force: bool = False) -> None:
+        """Explicitly prune stale request edges and isolated nodes."""
+        if force or self._events_since_prune >= self._prune_interval:
+            self._prune()
 
     def _prune(self) -> None:
+        self._events_since_prune = 0
         # Remove stale request edges (missed LOCK_ACQUIRED uprobes cause them to linger).
         if self.last_event_ts_ns:
             cutoff = self.last_event_ts_ns - _REQUEST_EDGE_TTL_NS

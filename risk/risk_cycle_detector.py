@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import logging
+import threading
 import time
 from typing import Dict, List, Optional, Set, Tuple
 import networkx as nx
@@ -16,6 +17,49 @@ import networkx as nx
 from .lock_order_tracker import LockOrderEvidence
 
 logger = logging.getLogger(__name__)
+
+
+def find_log_cycles_bounded(
+    graph: nx.DiGraph,
+    timeout_sec: float = 0.5,
+    max_cycles: int = 100,
+) -> Tuple[List[List[str]], bool]:
+    """Safely discovers Lock Order Graph cycles with timeout and O(V + E) fallback."""
+    if nx.is_directed_acyclic_graph(graph):
+        return [], False
+
+    raw_cycles: List[List[str]] = []
+
+    def _worker() -> None:
+        try:
+            for cycle in nx.simple_cycles(graph):
+                raw_cycles.append(cycle)
+                if len(raw_cycles) >= max_cycles:
+                    break
+        except Exception as ex:
+            logger.error("error inside LOG simple_cycles: %s", ex)
+
+    th = threading.Thread(target=_worker, daemon=True)
+    th.start()
+    th.join(timeout=timeout_sec)
+
+    timed_out = th.is_alive()
+    if timed_out:
+        logger.warning(
+            "Lock order simple_cycles timed out after %.2fs (%d cycles found); falling back",
+            timeout_sec, len(raw_cycles)
+        )
+
+    if not raw_cycles:
+        try:
+            edges = list(nx.find_cycle(graph, orientation="original"))
+            if edges:
+                fallback_cycle = [u for u, v in edges]
+                raw_cycles.append(fallback_cycle)
+        except (nx.NetworkXNoCycle, Exception):
+            pass
+
+    return raw_cycles, timed_out
 
 
 @dataclass
@@ -72,8 +116,9 @@ class RiskCycleDetector:
     Detects directed cycles in the Lock Order Graph and reports structured risk warnings.
     """
 
-    def __init__(self) -> None:
-        pass
+    def __init__(self, timeout_sec: float = 0.5, max_cycles: int = 100) -> None:
+        self.timeout_sec = timeout_sec
+        self.max_cycles = max_cycles
 
     def detect_risks(self, log_graph: nx.DiGraph) -> List[LockOrderRisk]:
         """
@@ -88,11 +133,11 @@ class RiskCycleDetector:
         if log_graph.number_of_edges() < 2:
             return []
 
-        try:
-            raw_cycles = list(nx.simple_cycles(log_graph))
-        except Exception as e:
-            logger.error("Error analyzing lock order cycles: %s", e)
-            return []
+        raw_cycles, _ = find_log_cycles_bounded(
+            log_graph,
+            timeout_sec=self.timeout_sec,
+            max_cycles=self.max_cycles,
+        )
 
         if not raw_cycles:
             return []
