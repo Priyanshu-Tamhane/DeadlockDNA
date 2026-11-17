@@ -13,6 +13,7 @@ build:
 	$(CC) $(CFLAGS) targets/test_2way.c     -o targets/test_2way
 	$(CC) $(CFLAGS) targets/test_3way.c     -o targets/test_3way
 	$(CC) $(CFLAGS) targets/test_semaphore.c -o targets/test_semaphore
+	$(CC) $(CFLAGS) targets/memcached_workload.c -o targets/memcached_workload
 	@mkdir -p benchmarks/workloads
 	$(CC) $(CFLAGS) benchmarks/workloads/workload_no_lock.c      -o benchmarks/workloads/workload_no_lock
 	$(CC) $(CFLAGS) benchmarks/workloads/workload_single_mutex.c  -o benchmarks/workloads/workload_single_mutex
@@ -42,7 +43,7 @@ check-ebpf:
 	@sudo bpftrace -l 'tracepoint:syscalls:*futex*' 2>/dev/null || echo "  (need sudo)"
 
 clean:
-	rm -f targets/test_2way targets/test_3way targets/test_semaphore
+	rm -f targets/test_2way targets/test_3way targets/test_semaphore targets/memcached_workload
 	rm -f benchmarks/workloads/workload_no_lock benchmarks/workloads/workload_single_mutex benchmarks/workloads/workload_contention benchmarks/workloads/workload_stress
 	rm -rf benchmarks/results
 	find . -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null; true

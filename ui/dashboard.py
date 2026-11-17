@@ -1,42 +1,33 @@
 """
-dashboard.py — DeadlockDNA Terminal Dashboard (ui/)
+ui/dashboard.py — DeadlockDNA Real-Time Web Dashboard (ui/)
 
-Rich-based live terminal dashboard.
-
-Updated from pipeline via dashboard.update(event, rag, deadlocks, risks).
-The detection pipeline drives the dashboard — not the reverse.
+Provides a modern interactive web-based dashboard for DeadlockDNA.
+Spins up a lightweight background HTTP/SSE daemon, serving an interactive
+physics-based graph canvas, live event streams, DNA fingerprints, and
+recovery recommendations directly in the user's browser.
 """
 
-import time
 from collections import deque
-from datetime import datetime
-from typing import List, Optional, Any
+from contextlib import contextmanager
+import logging
+import sys
+import time
+from typing import Any, Generator, List, Optional
+import webbrowser
 
-from rich import box
-from rich.console import Console, Group
-from rich.live import Live
-from rich.panel import Panel
-from rich.table import Table
-from rich.text import Text
-
-from graph.models import DeadlockResult
+from graph.models import DeadlockResult, Event
 from graph.rag import ResourceAllocationGraph
+from .web_server import WebDashboardServer
 
-_MAX_EVENTS = 5
-
-_OP_STYLE = {
-    "LOCK_REQUEST":  "bold red",
-    "LOCK_ACQUIRED": "bold green",
-    "LOCK_RELEASED": "dim green",
-}
+logger = logging.getLogger(__name__)
 
 
 class Dashboard:
     """
-    Terminal dashboard for DeadlockDNA.
+    Interactive Web Dashboard for DeadlockDNA.
 
     Usage:
-        dash = Dashboard("test_2way", 5000)
+        dash = Dashboard("test_2way", 5000, port=8080)
         with dash.live_context():
             for event in events:
                 rag.process_event(event)
@@ -44,179 +35,209 @@ class Dashboard:
                 dash.update(event, rag, deadlocks, risks)
     """
 
-    def __init__(self, target_name: str, pid: int) -> None:
+    def __init__(self, target_name: str, pid: int, port: int = 8080, open_browser: bool = True) -> None:
         self.target_name = target_name
         self.pid = pid
-        self._console = Console()
-        self._live: Optional[Live] = None
-        self._events: deque = deque(maxlen=_MAX_EVENTS)
+        self.port = port
+        self.open_browser = open_browser
+
+        self._server: Optional[WebDashboardServer] = None
+        self._events: deque = deque(maxlen=20)
         self._deadlocks: List[DeadlockResult] = []
         self._risks: List[Any] = []
         self._t0 = time.time()
         self._n_events = 0
+        self._deadlock_alert_shown = False
 
-    def live_context(self) -> Live:
-        self._live = Live(self._render(), console=self._console,
-                          refresh_per_second=4, screen=False)
-        return self._live
+    @contextmanager
+    def live_context(self) -> Generator["Dashboard", None, None]:
+        """Context manager starting the web dashboard daemon."""
+        self._server = WebDashboardServer(host="127.0.0.1", port=self.port)
+        actual_port = self._server.start()
+        self.port = actual_port
+        url = f"http://127.0.0.1:{self.port}"
 
-    def update(self, event, rag: ResourceAllocationGraph,
-               deadlocks: List[DeadlockResult],
-               risks: Optional[List[Any]] = None) -> None:
-        self._events.append(event)
+        print("\n" + "=" * 70, file=sys.stderr)
+        print(f"  ⚡ DeadlockDNA Web UI Server Active: {url}", file=sys.stderr)
+        print(f"  Target: {self.target_name} (PID: {self.pid or 'Discovering...'})", file=sys.stderr)
+        print("  Real-time RAG visualization, DNA fingerprinting & diagnostics live.", file=sys.stderr)
+        print("=" * 70 + "\n", file=sys.stderr)
+
+        if self.open_browser:
+            self._open_in_browser(url)
+
+        try:
+            yield self
+        finally:
+            if self._server:
+                self._server.stop()
+                self._server = None
+            print("\n[deadlockdna] Web UI server stopped.", file=sys.stderr)
+
+    def _open_in_browser(self, url: str) -> None:
+        """Opens URL in the browser, with native support for WSL to host browser."""
+        try:
+            import platform
+            import shutil
+            import subprocess
+            from pathlib import Path
+
+            is_wsl = "microsoft" in platform.uname().release.lower() or Path("/proc/sys/fs/binfmt_misc/WSLInterop").exists()
+            if is_wsl:
+                # 1. Try wslview (standard wslu tool)
+                if shutil.which("wslview"):
+                    subprocess.Popen(["wslview", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    return
+                # 2. Try launching Windows default browser via PowerShell
+                if shutil.which("powershell.exe"):
+                    subprocess.Popen(
+                        ["powershell.exe", "-NoProfile", "-Command", f"Start-Process '{url}'"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    return
+
+            # Native fallback (Linux/macOS/Windows)
+            webbrowser.open(url)
+        except Exception as e:
+            logger.debug("Automatic browser open skipped: %s", e)
+
+    def update(
+        self,
+        event: Event,
+        rag: ResourceAllocationGraph,
+        deadlocks: Optional[List[DeadlockResult]] = None,
+        risks: Optional[List[Any]] = None,
+    ) -> None:
+        """Pushes state updates to the web dashboard and logs to console."""
         self._n_events += 1
-        if deadlocks:
-            self._deadlocks = deadlocks
-        elif not deadlocks and self._deadlocks:
-            self._deadlocks = []          # cycle resolved
+        uptime_sec = int(time.time() - self._t0)
 
+        # Record recent event for UI table
+        self._events.append({
+            "timestamp_ns": event.timestamp_ns,
+            "operation": event.operation.name,
+            "tid": event.tid,
+            "pid": event.pid,
+            "resource": event.resource,
+        })
+
+        if deadlocks is not None:
+            self._deadlocks = deadlocks
         if risks is not None:
             self._risks = risks
 
-        if self._live:
-            self._live.update(self._render(rag))
+        # Extract RAG nodes and edges with rich source symbols (Upgrade 1)
+        g = rag.get_graph()
+        resolver = getattr(self, "_resolver", None)
+        if not resolver:
+            from diagnosis.symbol_resolver import SymbolResolver
+            self._resolver = SymbolResolver(target_hint=self.target_name)
+            resolver = self._resolver
 
-    def print_final_summary(self, rag: ResourceAllocationGraph) -> None:
-        self._console.print(self._render(rag))
+        nodes = []
+        for n in g.nodes():
+            if n.startswith("T"):
+                tid = int(n[1:]) if n[1:].isdigit() else 0
+                func_name = resolver.resolve_thread_function(tid, self.pid or event.pid)
+                nodes.append({
+                    "id": n,
+                    "label": f"T{tid} ({func_name})",
+                    "kind": "thread",
+                    "function": func_name,
+                })
+            else:
+                sym = resolver.resolve_resource(n, self.pid or event.pid)
+                nodes.append({
+                    "id": n,
+                    "label": sym.display_str,
+                    "kind": "resource",
+                    "symbol": sym.name,
+                    "location": sym.location_str,
+                })
+        edges = []
+        for u, v, data in g.edges(data=True):
+            edges.append({
+                "from": u,
+                "to": v,
+                "kind": data.get("kind", "allocation"),
+                "inferred": data.get("inferred", False),
+            })
 
-    # ── Rendering ─────────────────────────────────────────────────────────
-
-    def _render(self, rag: Optional[ResourceAllocationGraph] = None) -> Panel:
-        parts: list = [
-            self._info_panel(),
-            self._events_panel(),
-        ]
-        parts.append(self._rag_panel(rag))
-        if self._risks:
-            parts.append(self._risk_panel())
-        parts.append(self._status_panel())
-
-        return Panel(
-            Group(*parts),
-            title="[bold cyan]⬡  D E A D L O C K D N A[/bold cyan]",
-            subtitle=f"[dim]uptime {self._uptime()}  |  events {self._n_events}[/dim]",
-            border_style="cyan",
-            padding=(0, 1),
-        )
-
-    def _info_panel(self) -> Panel:
-        g = Table.grid(padding=(0, 2))
-        g.add_column(style="dim"); g.add_column(style="bold white")
-        g.add_row("Target :", self.target_name)
-        g.add_row("PID    :", str(self.pid) if self.pid else "—")
-        return Panel(g, title="[blue]Target[/blue]", border_style="blue",
-                     padding=(0, 1))
-
-    def _events_panel(self) -> Panel:
-        t = Table(box=box.SIMPLE, show_header=True,
-                  header_style="bold magenta", padding=(0, 1))
-        t.add_column("TIME",      style="dim",    width=14)
-        t.add_column("TID",       style="cyan",   width=9)
-        t.add_column("RESOURCE",  style="yellow", width=26)
-        t.add_column("OPERATION",                 width=17)
-
-        for ev in self._events:
-            ts  = datetime.fromtimestamp(ev.timestamp_ns / 1e9).strftime("%H:%M:%S.%f")[:12]
-            op  = ev.operation.name
-            t.add_row(ts, str(ev.tid), ev.resource,
-                      Text(op, style=_OP_STYLE.get(op, "white")))
-
-        return Panel(t, title="[magenta]Live Events[/magenta]",
-                     border_style="magenta", padding=(0, 0))
-
-    def _rag_panel(self, rag: Optional[ResourceAllocationGraph]) -> Panel:
-        edges = rag.get_edges() if rag is not None else []
-        if not edges:
-            body = Text("  (no edges — graph is empty)", style="dim")
-        else:
-            lines = []
-            for src, dst in edges:
-                line = Text()
-                if src.startswith("M@"):           # allocation: R → T
-                    line.append(src, "yellow"); line.append(" → ", "dim")
-                    line.append(dst, "cyan")
-                else:                              # request: T → R
-                    line.append(src, "cyan");   line.append(" → ", "dim")
-                    line.append(dst, "yellow")
-                lines.append(line)
-            body = Group(*lines)
-
-        return Panel(body, title="[yellow]Resource Allocation Graph[/yellow]",
-                     border_style="yellow", padding=(0, 1))
-
-    def _risk_panel(self) -> Panel:
-        parts = []
-        for rk in self._risks:
-            parts.append(Text("⚠  LOCK-ORDER INVERSION (Predictive Risk)", style="bold yellow on dark_goldenrod"))
-            parts.append(Text(f"Pattern : {rk.pattern}", style="bold yellow"))
-            threads_str = ", ".join(f"T{t}" for t in rk.threads_involved)
-            parts.append(Text(f"Scope   : {rk.scope} | Threads: {threads_str} | Confidence: {rk.confidence.upper()}", style="dim"))
-            parts.append(Text("Note    : This is a predictive lock-order risk, not an active deadlock hang.", style="dim italic"))
-            parts.append(Text(""))
-        if parts:
-            parts.pop()  # remove trailing empty line
-
-        return Panel(Group(*parts), title="[yellow]Lock-Order Risk Analysis (Feature D)[/yellow]",
-                     border_style="yellow", padding=(0, 1))
-
-    def _status_panel(self) -> Panel:
-        if not self._deadlocks:
-            return Panel(
-                Text("✅  No deadlock detected", style="bold green"),
-                title="[green]Status[/green]",
-                border_style="green",
-                padding=(0, 1),
-            )
-
-        parts = [Text("⚠  DEADLOCK DETECTED", style="bold red on dark_red")]
+        # Serialize deadlocks
+        serialized_dls = []
         for dl in self._deadlocks:
-            parts.append(Text("Cycle:", style="bold yellow"))
-            cyc = Text()
-            for i, node in enumerate(dl.cycle):
-                cyc.append(node, "bold cyan" if node.startswith("T") else "bold yellow")
-                if i < len(dl.cycle) - 1:
-                    cyc.append(" → ", "dim")
-            parts.append(cyc)
-
-            if dl.fingerprint:
-                parts.append(Text(
-                    f"\nDNA Fingerprint : {dl.fingerprint[:16]}... (recurrence: {dl.occurrence_count}x)",
-                    style="bold magenta"
-                ))
-                if dl.canonical_pattern:
-                    parts.append(Text(f"Canonical Pattern: {dl.canonical_pattern}", style="dim magenta"))
-
+            dl_dict = {
+                "detected": dl.detected,
+                "cycle": dl.cycle,
+                "threads": dl.threads,
+                "resources": dl.resources,
+                "latency_us": dl.latency_us,
+                "fingerprint": dl.fingerprint,
+                "canonical_pattern": dl.canonical_pattern,
+                "occurrence_count": dl.occurrence_count,
+                "diagnosis": None,
+                "recovery_plan": None,
+            }
             if dl.diagnosis:
-                diag = dl.diagnosis
-                conf_style = "bold green" if diag.confidence == "complete" else "bold yellow" if diag.confidence == "partial" else "bold red"
-                parts.append(Text(f"\nDiagnosis: {diag.summary}", style="bold white"))
-                parts.append(Text(f"Confidence: {diag.confidence.upper()}", style=conf_style))
-                parts.append(Text("Explanation:", style="bold yellow"))
-                for s in diag.steps:
-                    parts.append(Text(f"  • {s.description}", style="white"))
-                if diag.limitations:
-                    parts.append(Text("Limitations:", style="dim yellow"))
-                    for lim in diag.limitations:
-                        parts.append(Text(f"  - {lim}", style="dim"))
-
+                if hasattr(dl.diagnosis, "to_dict"):
+                    dl_dict["diagnosis"] = dl.diagnosis.to_dict()
+                else:
+                    dl_dict["diagnosis"] = {
+                        "summary": str(dl.diagnosis),
+                        "confidence": "complete",
+                        "steps": [],
+                    }
             if dl.recovery_plan:
-                plan = dl.recovery_plan
-                parts.append(Text("\nRecovery Recommendations (Feature E):", style="bold green"))
-                if plan.top_recommendation:
-                    top = plan.top_recommendation
-                    parts.append(Text(f"  ★ Recommended: {top.action_type.value} -> target: {top.target_id} (score: {top.score:.2f})", style="bold green"))
-                    parts.append(Text(f"    Rationale: {top.ranking_rationale}", style="dim"))
-                if plan.rejected_candidates:
-                    parts.append(Text("  Safety Policy Ineligibility Checks:", style="bold red"))
-                    for rej in plan.rejected_candidates[:2]:
-                        parts.append(Text(f"    ✗ Rejected {rej.action_type.value}: {rej.ineligibility_reason}", style="dim red"))
+                if hasattr(dl.recovery_plan, "to_dict"):
+                    dl_dict["recovery_plan"] = dl.recovery_plan.to_dict()
+                else:
+                    dl_dict["recovery_plan"] = str(dl.recovery_plan)
 
-            parts.append(Text(
-                f"\nDetection latency: {dl.latency_us:.1f} µs", style="bold white"))
+            serialized_dls.append(dl_dict)
 
-        return Panel(Group(*parts), title="[red]Status[/red]",
-                     border_style="red", padding=(0, 1))
+        # Serialize risks
+        serialized_risks = [r.to_dict() if hasattr(r, "to_dict") else str(r) for r in self._risks]
 
-    def _uptime(self) -> str:
-        s = int(time.time() - self._t0)
-        return f"{s // 60:02d}:{s % 60:02d}"
+        # Dispatch snapshot to Web UI
+        snapshot = {
+            "status": "DEADLOCK DETECTED" if self._deadlocks else "MONITORING",
+            "target_name": self.target_name,
+            "pid": self.pid or event.pid,
+            "nodes": nodes,
+            "edges": edges,
+            "deadlocks": serialized_dls,
+            "risks": serialized_risks,
+            "recent_events": list(self._events),
+            "total_events": self._n_events,
+            "uptime_sec": uptime_sec,
+            "last_updated": time.time(),
+        }
+
+        if self._server:
+            self._server.state_store.update(snapshot)
+
+        # Compact console progress output
+        op_name = event.operation.name
+        n_threads = len([n for n in nodes if n["id"].startswith("T")])
+        n_mutexes = len([n for n in nodes if n["id"].startswith("M@")])
+
+        if self._deadlocks and not self._deadlock_alert_shown:
+            self._deadlock_alert_shown = True
+            dl = self._deadlocks[0]
+            cycle_str = " ➔ ".join(dl.cycle)
+            print(f"\n[deadlockdna] 🚨 DEADLOCK DETECTED! Cycle: {cycle_str}", file=sys.stderr)
+            if dl.fingerprint:
+                print(f"[deadlockdna]    DNA Fingerprint: {dl.fingerprint} (seen {dl.occurrence_count}x)", file=sys.stderr)
+            if dl.diagnosis:
+                print(f"[deadlockdna]    Diagnosis: {dl.diagnosis.summary}", file=sys.stderr)
+            print(f"[deadlockdna]    Interactive view at: http://127.0.0.1:{self.port}\n", file=sys.stderr)
+        elif not self._deadlocks and self._deadlock_alert_shown:
+            self._deadlock_alert_shown = False
+            print("\n[deadlockdna] ✅ Deadlock cycle resolved.\n", file=sys.stderr)
+        else:
+            sys.stderr.write(
+                f"\r[deadlockdna] Event #{self._n_events:<4} | {op_name:<13} T{event.tid} ➔ {event.resource} "
+                f"| RAG: {n_threads} threads, {n_mutexes} locks | http://127.0.0.1:{self.port}"
+            )
+            sys.stderr.flush()

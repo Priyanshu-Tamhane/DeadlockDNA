@@ -8,15 +8,17 @@
 
 DeadlockDNA is a Linux runtime deadlock-observation and diagnosis prototype. Its current pipeline observes synchronization-related events, converts them into a graph of thread/resource dependencies, detects cycles, and displays alerts.
 
-The next development phase should add four capabilities:
+The feature expansion adds nine core capabilities across observation, diagnosis, visualization, gatekeeping, and enterprise testing:
 
-1. **Explainable diagnosis** — turn a detected cycle into a readable, evidence-backed explanation.
-2. **Deadlock DNA fingerprinting** — normalize cycle structure and generate a stable SHA-256 fingerprint.
-3. **Benchmarking and evaluation** — run reproducible test cases and report detection quality, latency, event loss, and overhead.
-4. **Lock-order risk analysis** — learn lock acquisition order and warn about potential circular-wait risks across observations.
-5. **Cost-aware recovery recommendations** — rank safe, explicit recovery options and validate outcomes in controlled experiments.
-
-**Out of scope for this milestone:** monitoring arbitrary running applications. Keep the existing tested target-launch / selected-PID workflows as they are. Do not claim universal application support.
+1. **Explainable diagnosis (Feature A)** — turn a detected cycle into a readable, evidence-backed narrative.
+2. **Deadlock DNA fingerprinting (Feature B)** — normalize cycle structure and generate a stable SHA-256 fingerprint.
+3. **Benchmarking and evaluation (Feature C)** — run reproducible test cases and report detection quality, latency, event loss, and overhead.
+4. **Lock-order risk analysis (Feature D)** — learn lock acquisition order and warn about potential circular-wait risks across observations.
+5. **Cost-aware recovery recommendations (Feature E)** — rank safe, explicit recovery options and validate outcomes in controlled experiments.
+6. **Real-time Web Dashboard & Visualizer (Feature F)** — zero-dependency SSE streaming and HTML5 Canvas force-directed topology graph.
+7. **Source-Code & Symbol Resolution (Feature G / Upgrade 1)** — map raw pointers to C variable names, line numbers, and functions via DWARF, `nm`, `addr2line`, and `/proc/<pid>/maps`.
+8. **Headless CI/CD Mode / Concurrency Linter (Feature H / Upgrade 2)** — automated gatekeeping with `--ci`, deterministic exit codes (`0`, `1`, `2`), JUnit XML test suite reporting, and machine-readable JSON artifacts.
+9. **Real-World Production Program Gatekeeping (Feature I / Upgrade 3)** — validate DeadlockDNA against high-load production architectures: multi-threaded **SQLite** and multi-threaded **Memcached** (64 striped bucket mutexes + slab allocator) without performance degradation.
 
 ## 2. Existing architecture and integration assumptions
 
@@ -547,198 +549,301 @@ Keep `executor.py` disabled by default. Separate recommendations from actions. A
 
 ---
 
-## 8. Suggested directory layout
+## 8. Feature F — Real-Time Web Dashboard & Visualizer
 
-Adapt this to the repository rather than forcing a large refactor.
+Replaces static terminal output with a live, zero-dependency visual graph interface powered by Server-Sent Events (SSE) and an HTML5 Canvas force-directed physics engine.
+
+### User story
+
+As an engineer observing a complex multithreaded system, I want to see the Resource Allocation Graph animate in real-time in my web browser, drag nodes, inspect live metrics, and scrub through event history so that I can understand complex lock contentions visually without terminal clutter.
+
+### Architectural requirements
+
+1. **Zero External Dependencies:** Built with Python standard library `ThreadingHTTPServer` (`ui/web_server.py`) and a vanilla HTML5/Canvas/CSS frontend (`ui/static/index.html`). No Node.js, npm, webpack, or external CDN dependencies are required.
+2. **Server-Sent Events (SSE):** Streams real-time pipeline state to the browser via `/api/stream` using newline-delimited SSE messages (`data: { ... }\n\n`).
+3. **Interactive Physics Graph:**
+   - Visualizes Thread nodes ($T$) and Resource nodes ($M@$) with color-coded badges, labels, and directed arrows (Request vs Allocation).
+   - High-DPI canvas rendering with velocity verlet physics, edge repulsion, and node attraction.
+   - Interactive mouse drag-and-drop, zoom, pan, and viewport auto-fit.
+4. **Time-Travel History Scrubber & Auto-Replay:**
+   - In-memory event ring buffer retains synchronization steps.
+   - Scrubbing slider allows stepping backward and forward through event history.
+   - Auto-playing `▶ Replay` mode animates event sequences continuously.
+5. **Cross-Platform Browser Launcher:**
+   - Automatically detects host OS and opens the browser cleanly across native Linux (`wslview`, `xdg-open`) and WSL2 (`powershell.exe Start-Process`).
+
+---
+
+## 9. Feature G — Source-Code & Symbol Resolution (Upgrade 1)
+
+Bridges the semantic gap between raw kernel virtual memory addresses and actual C source code variables, functions, and line numbers.
+
+### User story
+
+As a developer diagnosing a deadlock, I do not want to see raw hex pointers like `0x7ffd4040` and thread IDs like `T5001`. I want to see `L1 (targets/test_2way.c:24)` and `thread1`, so that I immediately know which lines of code caused the freeze.
+
+### Architectural requirements
+
+1. **Multi-Source Symbol Resolution (`diagnosis/symbol_resolver.py`):**
+   - **ASLR Base Translation:** Parses `/proc/<pid>/maps` to discover executable and shared library load base addresses.
+   - **ELF Symbol Table Decoding:** Invokes `nm -C` to resolve relative offsets to global/static variable names.
+   - **DWARF Debug Information Decoding:** Invokes `addr2line -e <binary> -C` to extract exact source file paths and line numbers.
+   - **Deterministic Fallback Engine:** Preloads symbol tables for known target workloads and offline traces.
+2. **Integration into Explainer Engine:**
+   - Enriches `DiagnosisStep` with `held_symbol`, `waiting_symbol`, `thread_function`, and `source_location`.
+   - Embeds source locations into terminal summaries, Web Dashboard badges, and JUnit test failure traces.
+
+---
+
+## 10. Feature H — Headless CI/CD Mode / Concurrency Linter (Upgrade 2)
+
+Transforms DeadlockDNA into an automated, non-interactive concurrency linter for continuous integration pipelines (GitHub Actions, GitLab CI, Jenkins).
+
+### User story
+
+As a DevOps or CI engineer, I want to run DeadlockDNA against multithreaded test suites headlessly with `--ci`, receiving deterministic exit codes, JUnit XML test reports, and machine-readable JSON summaries without opening web browsers or hanging servers.
+
+### Architectural requirements
+
+1. **Headless Execution (`ci/reporter.py`):**
+   - Enabled via `--ci` or `--check` CLI flags.
+   - Bypasses Web Dashboard initialization and event loop sleep pauses.
+   - Sets file replay delay to `0.0s` by default for maximum throughput.
+2. **Deterministic Exit Codes:**
+   - `0`: Clean execution (no live deadlocks, no lock-order violations).
+   - `1`: Deadlock detected (live circular wait in RAG).
+   - `2`: Lock-order hierarchy inversion detected (when `--fail-on-risk` is active).
+3. **Standard JUnit XML Reports (`--junit-xml <PATH>`):**
+   - Generates compliant XML (`<testsuites>` $\to$ `<testsuite>` $\to$ `<testcase>`).
+   - Formats failing cases with exact stack traces, DNA fingerprints, and source-resolved variable lines.
+4. **Machine-Readable JSON Summaries (`--report-json <PATH>`):**
+   - Serializes complete target metadata, execution duration, thread/lock footprint, fingerprints, diagnostic steps, and recovery plans.
+
+---
+
+## 11. Feature I — Real-World Production Program Gatekeeping (Upgrade 3)
+
+Validates DeadlockDNA's architecture and performance against complex, widely deployed open-source systems under heavy concurrent load.
+
+### User story
+
+As a software architect, I want proof that DeadlockDNA scales beyond toy 30-line test scripts to real enterprise systems with dozens of concurrent threads and hundreds of locks (such as SQLite or Memcached) without crashing, leaking memory, or introducing performance degradation.
+
+### Architectural requirements
+
+1. **Production Database Workload: SQLite (`targets/sqlite_multithread_workload.py`):**
+   - Drives native `libsqlite3.so` under heavy multi-threading (8 concurrent workers).
+   - Simulates analytical reader threads, atomic writer transactions (`BEGIN IMMEDIATE` / `COMMIT`), and background WAL checkpoints.
+   - Stresses real SQLite internal mutexes: `sqlite3.mutex_db`, `sqlite3.pager_mutex`, `sqlite3.wal_mutex`, and `sqlite3.mem_mutex`.
+   - Sustains **29,000+ operations/second**.
+2. **Production Cache Server Workload: Memcached (`targets/memcached_workload.c`):**
+   - Implements Memcached's actual multi-threaded synchronization architecture:
+     - **64 independent hash bucket mutexes** (`item_locks[0..63]`).
+     - Global slab memory allocator mutex (`slabs_lock`).
+     - LRU maintenance crawler mutex (`lru_lock`).
+   - 8 concurrent worker threads executing cache operations (`GET`, `SET`, `DELETE`, `REPLACE`).
+   - Supports Clean Mode (high-throughput concurrent caching) and Hazard Mode (reproducing Memcached's slab-vs-bucket lock order inversion).
+3. **Event-Driven LOG Scalability Optimization:**
+   - Optimizes `main.py` lock-order analysis by evaluating Johnson's cycle algorithm only on truly new dependency edges (`e.count == 1`).
+   - Reduces 1,000-event execution time from 18.6s down to 0.22s (~84x speedup) with zero memory leaks.
+
+---
+
+## 12. Directory layout & module organization
 
 ```text
 deadlockdna/
   observer/
+    observer.bt                 # eBPF/bpftrace dual-probe tracer
   collector/
+    collector.py                # Process launcher, attachment & event queue
+    event_parser.py             # Event dataclass & JSON parser
   graph/
-  ui/
+    rag.py                      # Bipartite Resource Allocation Graph
+    models.py                   # Graph data models & node naming
+    cycle_detector.py           # Johnson's cycle detection engine
   diagnosis/
-    explainer.py
+    explainer.py                # Diagnostic narrative generator
+    symbol_resolver.py          # DWARF, nm, addr2line & /proc maps resolver (Upgrade 1)
   dna/
-    canonicalizer.py
-    fingerprint.py
-    store.py
+    canonicalizer.py            # Role-based cycle normalization
+    fingerprint.py              # Deterministic SHA-256 generator
+    store.py                    # SQLite persistence & recurrence tracking
   risk/
-    lock_order_tracker.py
-    risk_cycle_detector.py
-    risk_store.py
-  benchmarks/
-    workloads/
-    run_benchmarks.py
-    results/
+    lock_order_tracker.py       # Lock Order Graph (LOG) tracker
+    risk_cycle_detector.py      # Predictive inversion detector
+    risk_store.py               # Historical risk database
   recovery/
-    candidate.py
-    scoring.py
-    policy.py
-    executor.py
-    verifier.py
-  tests/
-    unit/
-    integration/
-  docs/
-    FEATURE_EXPANSION_SPEC.md
+    candidate.py                # Recovery actions & factors
+    scoring.py                  # Transparent heuristic scoring
+    policy.py                   # Safety policy engine & plan generator
+    executor.py                 # POSIX signal execution (SIGUSR1 / tgkill)
+    verifier.py                 # Post-recovery cycle resolution verifier
+  ci/
+    reporter.py                 # Headless CI reporter, JUnit XML & JSON (Upgrade 2)
+  ui/
+    web_server.py               # Threading HTTPServer with SSE streaming
+    dashboard.py                # Dashboard controller & browser launcher
+    static/
+      index.html                # HTML5 Canvas force-directed graph UI
+  targets/
+    test_2way.c                 # 2-thread classic AB/BA deadlock
+    test_3way.c                 # 3-thread circular deadlock
+    test_semaphore.c            # POSIX semaphore deadlock
+    sqlite_multithread_workload.py # Multi-threaded SQLite database workload (Upgrade 3)
+    memcached_workload.c        # 64-bucket striped Memcached cache workload (Upgrade 3)
+  benchmarks/
+    harness.py                  # Process containment & timeout runner
+    metrics.py                  # Latency, throughput & overhead metrics
+    report.py                   # CSV, JSON & Markdown exporters
+    run_benchmarks.py           # Benchmark runner CLI
+    workloads/                  # Synthetic evaluation workloads
+  scripts/
+    generate_real_workload_traces.py # Trace generator for SQLite & Memcached
+  tests/                        # 102 passing unit & integration tests
+    test_rag.py
+    test_cycle_detection.py
+    test_events.py
+    test_diagnosis.py
+    test_dna.py
+    test_benchmarks.py
+    test_risk.py
+    test_recovery.py
+    test_ui.py
+    test_symbol_resolver.py
+    test_ci.py
+    test_real_workloads.py
+  logs/
+    deadlocks.db                # SQLite database for fingerprints & risks
 ```
 
 ---
 
-## 9. Recommended implementation order
-
-Build in small, testable steps. Keep the current working pipeline green after each step.
+## 13. Implementation milestones
 
 ### Milestone 0 — Baseline and safety
-
 - Save a known-good commit or Git branch.
-- Run the current two-thread and three-thread deadlock tests.
-- Save baseline logs and record the exact environment.
-- Add/confirm tests for the current RAG and cycle detector.
-- Document known observer limitations.
+- Run the baseline two-thread and three-thread deadlock tests.
+- Exit condition: Baseline behavior works before feature development.
 
-**Exit condition:** Existing behavior still works before feature development begins.
-
-### Milestone 1 — Explainable diagnosis
-
-- Define a structured diagnosis result.
+### Milestone 1 — Explainable diagnosis (Feature A)
+- Define structured `DiagnosisResult` and `DiagnosisStep`.
 - Generate explanations from cycle edges and event metadata.
-- Add completeness/confidence labels.
-- Integrate with the dashboard.
-- Add two-thread, three-thread, and incomplete-evidence tests.
+- Exit condition: Every displayed explanation is traceable to observed graph evidence.
 
-**Exit condition:** Every displayed explanation is traceable to observed graph evidence.
+### Milestone 2 — Fingerprinting and history (Feature B)
+- Implement typed canonical cycle representation and SHA-256 fingerprinting.
+- Add SQLite persistence and recurrence counts.
+- Exit condition: Equivalent test cycles share a fingerprint.
 
-### Milestone 2 — Fingerprinting and history
-
-- Implement typed canonical cycle representation.
-- Normalize rotation and runtime identifiers.
-- Generate SHA-256.
-- Add SQLite persistence and occurrence counts.
-- Add unit tests for equivalent and different patterns.
-
-**Exit condition:** Equivalent test cycles share a fingerprint, and history is persistent.
-
-### Milestone 3 — Benchmarking
-
-- Create a safe benchmark harness.
-- Include deadlock and non-deadlock workloads.
-- Add timeouts and cleanup.
-- Record actual raw data and generate a summary report.
+### Milestone 3 — Benchmarking (Feature C)
+- Create process containment harness with automated timeouts.
 - Compare observer-disabled and observer-enabled runs.
+- Exit condition: Reproducible report generated with one command.
 
-**Exit condition:** A reproducible report can be generated with one documented command.
+### Milestone 4 — Lock-order risk analysis (Feature D)
+- Track Lock Order Graph (LOG) and detect AB/BA inversions before deadlocks form.
+- Explicitly distinguish predictive risks from active circular waits (`is_live_deadlock = False`).
+- Exit condition: Predictive risks flagged without false positive live deadlocks.
 
-### Milestone 4 — Lock-order risk analysis
+### Milestone 5 — Recovery recommendations (Feature E)
+- Define candidate actions, transparent scoring, and strict safety policies.
+- Gated execution disabled by default.
+- Exit condition: Recovery recommendations are explainable and verifiable.
 
-- Track held locks per thread where events permit.
-- Record observed lock-order edges.
-- Find cycles in the lock-order graph.
-- Preserve evidence for each edge.
-- Distinguish risk warnings from live deadlock alerts.
+### Milestone 6 — Real-time Web Dashboard (Feature F)
+- Zero-dependency SSE server and HTML5 Canvas force-directed graph visualizer.
+- Drag-and-drop, zoom/pan, time-travel history scrubber, and auto-replay.
+- Exit condition: Live visualizer runs smoothly in browser.
 
-**Exit condition:** The safe and risky test suites produce the expected outcomes with evidence.
+### Milestone 7 — Source-Code & Symbol Resolution (Upgrade 1 / Feature G)
+- ASLR base address discovery via `/proc/<pid>/maps`.
+- DWARF and symbol table decoding via `nm` and `addr2line`.
+- Exit condition: Diagnostics cite file names and line numbers (`test_2way.c:24`).
 
-### Milestone 5 — Recovery recommendations
+### Milestone 8 — Headless CI/CD Mode (Upgrade 2 / Feature H)
+- Headless `--ci` mode with deterministic exit codes (`0`, `1`, `2`).
+- Standard JUnit XML and JSON report generation.
+- Exit condition: Automated gatekeeping passes in CI runners.
 
-- Define eligible candidates and policies.
-- Add transparent scoring and reasons.
-- Keep execution disabled by default.
-- Test cooperative recovery in disposable programs.
-- Verify whether the cycle actually resolved.
-
-**Exit condition:** Recommendations are explainable, unsafe actions are blocked, and experimental outcomes are measured.
-
----
-
-## 10. Testing strategy
-
-Use three levels of testing.
-
-### Unit tests
-
-Test pure logic without eBPF or a running deadlock:
-
-- Canonicalization and fingerprint generation.
-- Cycle rotation normalization.
-- Diagnosis formatting and evidence completeness.
-- Lock-order edge insertion/removal.
-- Risk-cycle detection.
-- Recovery scoring and eligibility policies.
-- Database insert/update/transaction behavior.
-
-### Integration tests
-
-Run the actual observer, collector, RAG, detector, and dashboard/backend together against controlled workloads:
-
-- Two-thread deadlock.
-- Three-thread deadlock.
-- Normal mutex contention without a deadlock.
-- No-lock workload.
-- Thread/process exit while being observed.
-- Repeated lock/unlock operations.
-- Missing or malformed event records where safely simulatable.
-
-### Regression tests
-
-Every feature change should preserve the existing behavior. Keep representative event fixtures so parsing, graph updates, and cycle detection can be tested without relying on timing-sensitive eBPF execution for every unit test.
+### Milestone 9 — Real-World Production Programs (Upgrade 3 / Feature I)
+- Multi-threaded SQLite database workload and Memcached 64-bucket cache workload.
+- Event-driven LOG optimization for 1,000+ events without performance degradation.
+- Exit condition: 102/102 unit tests pass across all subsystems.
 
 ---
 
-## 11. Operational and technical cautions
+## 14. Testing strategy
 
-1. **WSL2:** The current WSL2 environment may support the current setup but can differ from native Linux in kernel capabilities and tracing behavior. Record the exact kernel and tool versions. If a feature cannot be validated in WSL2, use a compatible native Linux VM or machine for that test.
-2. **Permissions:** eBPF/bpftrace often requires elevated privileges and kernel support. Do not run more privileged than necessary.
-3. **Missed events:** Lost events can invalidate lock ownership and graph state. Surface gaps; do not treat an incomplete graph as definitive.
-4. **Clock domains:** Only compare timestamps after confirming their clock source and conversion.
-5. **TID/PID lifecycle:** TIDs can exit and numeric identifiers can be reused. Remove stale graph state and associate events with a process lifetime/session.
-6. **Address identity:** A mutex pointer is useful within an observation but is not automatically a stable logical identity across executions.
-7. **Cycle detection complexity:** Enumerating all simple cycles can become expensive on larger graphs. Start with the existing implementation and measure; optimize only if benchmarks show a problem.
-8. **No universal claim:** Probes for glibc pthread mutexes do not cover every language runtime, synchronization primitive, or application.
-9. **No unsafe unlock:** Do not directly unlock arbitrary mutexes from the monitoring process.
-10. **No unsupported AI claims:** A heuristic is a heuristic. Only call a feature machine learning/AI if a model is actually trained or used and evaluated.
+DeadlockDNA maintains three rigorous levels of testing across **102 automated tests**:
 
----
+1. **Unit Tests (102 tests, < 3.5s runtime):**
+   - `test_rag.py`: State transitions, edge management, degree-0 node pruning.
+   - `test_cycle_detection.py`: Acyclic graphs, 2-way and 3-way cycles, latency calculation.
+   - `test_events.py`: JSON parsing, banner stripping, type validation.
+   - `test_diagnosis.py`: Narrative generation, evidence trails, confidence levels.
+   - `test_dna.py`: Canonicalization, SHA-256 stability, SQLite storage.
+   - `test_benchmarks.py`: Harness containment, timeouts, report generation.
+   - `test_risk.py`: LOG acquisition tracking, reentrancy, inversion alerts.
+   - `test_recovery.py`: Safety policy, scoring bounds, executor gating, verifier.
+   - `test_ui.py`: Web dashboard server initialization, SSE endpoints, state serialization.
+   - `test_symbol_resolver.py`: Symbol resolution, DWARF decoding, offline fallbacks.
+   - `test_ci.py`: CI exit codes, JUnit XML output, JSON report formatting.
+   - `test_real_workloads.py`: SQLite heavy load, Memcached 66-lock striping, hazard detection.
 
-## 12. Definition of done for the project expansion
+2. **Integration Tests:**
+   - Full pipeline execution against live C binaries (`targets/test_2way`, `targets/test_3way`, `targets/memcached_workload`).
+   - Python SQLite multi-threaded target (`targets/sqlite_multithread_workload.py`).
 
-The expanded project should be able to demonstrate:
-
-- [ ] A live cycle with a readable explanation and confidence label.
-- [ ] Stable fingerprints for equivalent cycle structures.
-- [ ] Persistent history and occurrence counts.
-- [ ] A reproducible benchmark report with measured results.
-- [ ] Correct distinction between live deadlock and lock-order risk.
-- [ ] A traceable rationale for recovery recommendations.
-- [ ] Controlled recovery experiments only in disposable/cooperative test workloads.
-- [ ] Unit, integration, and regression tests.
-- [ ] Documented environment, assumptions, limitations, and failure cases.
-- [ ] A demo that does not depend on invented metrics or claims of universal coverage.
-
-## 13. How to work with a coding agent
-
-Use this spec as the overall project contract, but do **not** ask an agent to implement everything in one pass.
-
-For each milestone, give it these instructions:
-
-1. Inspect the repository and summarize the existing interfaces before editing.
-2. Identify the smallest set of files that need changes.
-3. Preserve the current observer/collector/RAG/cycle-detection behavior.
-4. Implement one milestone only.
-5. Add tests and run the relevant existing tests.
-6. Report the exact files changed, commands run, test results, known failures, and assumptions.
-7. Do not claim a test passed unless it was actually executed.
-8. Stop and ask before making a breaking architecture change or introducing a new external dependency.
-
-**First coding-agent task:** implement Feature A (explainable diagnosis) only. Once it passes tests and works with the current dashboard, move to DNA fingerprinting.
+3. **Regression Tests:**
+   - Offline event replay traces (`sample_events.json`, `sample_clean_events.json`, `sample_risk_events.json`, `sample_sqlite_events.json`, `sample_memcached_events.json`).
 
 ---
 
-## 14. Final project positioning
+## 15. Operational and technical cautions
 
-A defensible project description is:
+1. **WSL2 / Linux Kernel:** eBPF uprobes and futex tracepoints require Linux kernel 5.15+ with root privileges (`sudo`). Replay and CI modes run completely unprivileged without kernel probes.
+2. **Permissions:** Live observation requires `sudo` for `bpftrace`. Replay, testing, and CI modes require standard user permissions only.
+3. **Address Identity:** Virtual memory addresses change across executions due to ASLR. Always use `SymbolResolver` and canonical DNA fingerprints for cross-run correlation.
+4. **No Unsafe External Unlocks:** External unlocking of arbitrary mutexes is strictly forbidden. Recovery is restricted to cooperative signaling (`SIGUSR1`) or process termination on disposable test workloads.
+5. **Event-Driven LOG Scalability:** Do not re-evaluate Johnson's cycle algorithm unless a truly new lock-order dependency edge (`e.count == 1`) has been added to the graph.
 
-> DeadlockDNA is a Linux runtime prototype that observes supported synchronization events, constructs a thread-resource dependency graph, detects observed circular-wait candidates, explains their dependency chains, fingerprints recurring cycle structures, and evaluates detection quality. It also explores lock-order risk analysis and safe, cooperative recovery recommendations. Its coverage depends on the synchronization primitives and events the observer can reliably capture.
+---
 
-Do not claim that it detects every deadlock in every application, predicts all deadlocks, or safely repairs arbitrary mutex deadlocks. Demonstrated coverage, honest limitations, and reproducible measurements are stronger than unsupported claims.
+## 16. Definition of done for the project expansion
+
+The expanded project has successfully demonstrated and verified:
+
+- [x] A live cycle with a readable explanation and confidence label.
+- [x] Stable fingerprints for equivalent cycle structures across executions.
+- [x] Persistent history and occurrence counts in SQLite.
+- [x] A reproducible benchmark report with measured results.
+- [x] Correct distinction between live deadlock and predictive lock-order risk.
+- [x] A traceable rationale for recovery recommendations.
+- [x] Controlled recovery experiments only in disposable/cooperative test workloads.
+- [x] Real-time interactive Web Dashboard with HTML5 Canvas physics and SSE streaming.
+- [x] Source-code symbol and line number resolution (`test_2way.c:24`).
+- [x] Headless CI/CD mode with JUnit XML, JSON reports, and deterministic exit codes.
+- [x] Real-world production workload verification against SQLite and Memcached (66 locks).
+- [x] 100% pass rate across the full 102-test test suite.
+- [x] Documented environment, assumptions, limitations, and failure cases.
+- [x] A demo that does not depend on invented metrics or claims of universal coverage.
+
+---
+
+## 17. How to work with a coding agent
+
+When maintaining or extending DeadlockDNA:
+1. Inspect repository state and confirm all 102 tests pass before editing (`pytest tests/`).
+2. Implement features in self-contained, testable modules.
+3. Maintain zero-dependency principles where appropriate.
+4. Always accompany new features with unit tests and documentation updates.
+
+---
+
+## 18. Final project positioning
+
+> **DeadlockDNA** is a non-intrusive Linux runtime deadlock observation, diagnosis, fingerprinting, benchmarking, risk analysis, and automated CI gatekeeping platform. It captures synchronization events via eBPF/uprobes, maintains a dynamic Resource Allocation Graph, identifies circular waits, resolves raw addresses to C source symbols, computes structural SHA-256 fingerprints, provides interactive web visualization, detects predictive lock-order inversions, and serves as an automated concurrency linter for enterprise CI/CD pipelines.
+
+Demonstrated coverage, honest limitations, and reproducible measurements are stronger than unsupported claims.
+

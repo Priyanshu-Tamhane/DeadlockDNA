@@ -1,0 +1,1315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DeadlockDNA — Live Concurrency & Deadlock Visualizer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;600&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-base: #090d16;
+      --bg-surface: #111827;
+      --bg-surface-elevated: #1a2333;
+      --bg-surface-hover: #222e44;
+      --border-subtle: #1e293b;
+      --border-prominent: #334155;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --text-dim: #64748b;
+      --color-primary: #38bdf8;
+      --color-emerald: #10b981;
+      --color-amber: #f59e0b;
+      --color-crimson: #ef4444;
+      --color-purple: #a855f7;
+      --shadow-glow-red: 0 0 25px rgba(239, 68, 68, 0.45);
+      --shadow-card: 0 4px 20px -2px rgba(0, 0, 0, 0.5);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      height: 100%;
+      width: 100%;
+      overflow: hidden;
+      font-family: 'Inter', sans-serif;
+      background-color: var(--bg-base);
+      color: var(--text-main);
+      display: flex;
+      flex-direction: column;
+      font-size: 13px;
+    }
+
+    /* Top Navigation */
+    header {
+      background: var(--bg-surface);
+      border-bottom: 1px solid var(--border-subtle);
+      padding: 10px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 54px;
+      flex-shrink: 0;
+      z-index: 20;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .logo-badge {
+      background: linear-gradient(135deg, #0284c7, #6366f1);
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 16px;
+      font-weight: 800;
+      color: #fff;
+      box-shadow: 0 0 15px rgba(2, 132, 199, 0.4);
+    }
+    .brand-title {
+      font-size: 16px;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      color: #fff;
+    }
+    .brand-subtitle {
+      font-size: 11px;
+      color: var(--text-dim);
+      font-family: 'Fira Code', monospace;
+    }
+    .header-stats {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .stat-pill {
+      background: var(--bg-surface-elevated);
+      border: 1px solid var(--border-subtle);
+      padding: 4px 10px;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-family: 'Fira Code', monospace;
+      font-size: 11px;
+    }
+    .stat-pill .label { color: var(--text-dim); }
+    .stat-pill .val { color: var(--text-main); font-weight: 600; }
+
+    .status-badge {
+      padding: 5px 12px;
+      border-radius: 9999px;
+      font-weight: 700;
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .status-badge.normal {
+      background: rgba(16, 185, 129, 0.15);
+      color: #34d399;
+      border: 1px solid rgba(16, 185, 129, 0.3);
+    }
+    .status-badge.deadlock {
+      background: rgba(239, 68, 68, 0.2);
+      color: #f87171;
+      border: 1px solid rgba(239, 68, 68, 0.5);
+      animation: pulse-red 1.5s infinite;
+      box-shadow: var(--shadow-glow-red);
+    }
+    @keyframes pulse-red {
+      0%, 100% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(1.02); opacity: 0.85; }
+    }
+
+    /* Main App Body */
+    .app-body {
+      display: grid;
+      grid-template-columns: 62% 38%;
+      height: calc(100vh - 54px);
+      width: 100%;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    /* Left Pane: Interactive Graph Canvas */
+    .graph-pane {
+      display: flex;
+      flex-direction: column;
+      border-right: 1px solid var(--border-subtle);
+      background: radial-gradient(circle at center, #111a2d 0%, #090d16 100%);
+      position: relative;
+      height: 100%;
+      min-height: 0;
+      overflow: hidden;
+    }
+    .graph-toolbar {
+      position: absolute;
+      top: 14px;
+      left: 14px;
+      z-index: 10;
+      display: flex;
+      gap: 6px;
+    }
+    .tool-btn {
+      background: rgba(17, 24, 39, 0.85);
+      backdrop-filter: blur(8px);
+      border: 1px solid var(--border-prominent);
+      color: var(--text-muted);
+      padding: 6px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 11px;
+      font-weight: 600;
+      transition: all 0.15s ease;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .tool-btn:hover {
+      background: var(--bg-surface-hover);
+      color: var(--text-main);
+      border-color: var(--color-primary);
+    }
+    .tool-btn.active {
+      background: var(--color-primary);
+      color: #000;
+      border-color: var(--color-primary);
+    }
+    .graph-legend {
+      position: absolute;
+      top: 14px;
+      right: 14px;
+      z-index: 10;
+      background: rgba(17, 24, 39, 0.85);
+      backdrop-filter: blur(8px);
+      border: 1px solid var(--border-prominent);
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-size: 11px;
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      pointer-events: none;
+    }
+    .legend-item { display: flex; align-items: center; gap: 8px; }
+    .legend-dot { width: 10px; height: 10px; border-radius: 50%; }
+    .dot-thread { background: #38bdf8; box-shadow: 0 0 6px #38bdf8; }
+    .dot-mutex { background: #818cf8; border-radius: 2px; }
+    .dot-alloc { width: 16px; height: 2px; background: #10b981; }
+    .dot-req { width: 16px; height: 2px; background: #f59e0b; border-bottom: 2px dashed #f59e0b; }
+    .dot-deadlock { width: 16px; height: 3px; background: #ef4444; box-shadow: 0 0 8px #ef4444; }
+
+    /* Canvas Wrapper */
+    .canvas-wrap {
+      flex: 1;
+      width: 100%;
+      height: 100%;
+      min-height: 0;
+      position: relative;
+      overflow: hidden;
+      cursor: grab;
+    }
+    .canvas-wrap:active { cursor: grabbing; }
+    #rag-canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    /* Scrubber / Time-Travel */
+    .timeline-bar {
+      background: var(--bg-surface);
+      border-top: 1px solid var(--border-subtle);
+      padding: 10px 18px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      z-index: 10;
+      flex-shrink: 0;
+      height: 48px;
+    }
+    .time-label {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--text-muted);
+      white-space: nowrap;
+      font-family: 'Fira Code', monospace;
+    }
+    .timeline-slider-wrap {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .slider {
+      flex: 1;
+      accent-color: var(--color-primary);
+      cursor: pointer;
+    }
+    .live-indicator {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      background: rgba(239, 68, 68, 0.2);
+      color: #f87171;
+      border: 1px solid rgba(239, 68, 68, 0.4);
+      cursor: pointer;
+    }
+    .live-indicator.live-active {
+      background: rgba(16, 185, 129, 0.2);
+      color: #34d399;
+      border-color: rgba(16, 185, 129, 0.4);
+    }
+    .pulse-circle {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
+    /* Right Pane: Diagnostics & Cards */
+    .diag-pane {
+      background: var(--bg-surface);
+      display: flex;
+      flex-direction: column;
+      overflow-y: auto;
+      padding: 16px;
+      gap: 14px;
+      height: 100%;
+      min-height: 0;
+    }
+
+    .card {
+      background: var(--bg-surface-elevated);
+      border: 1px solid var(--border-subtle);
+      border-radius: 8px;
+      padding: 14px;
+      box-shadow: var(--shadow-card);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      flex-shrink: 0;
+    }
+    .card-title {
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .card-deadlock {
+      border: 1px solid rgba(239, 68, 68, 0.5);
+      background: linear-gradient(180deg, rgba(239, 68, 68, 0.08) 0%, rgba(26, 35, 51, 1) 100%);
+      box-shadow: 0 0 25px rgba(239, 68, 68, 0.15);
+    }
+    .card-deadlock .card-title {
+      color: #f87171;
+    }
+
+    /* DNA Fingerprint */
+    .dna-box {
+      background: #090d16;
+      border: 1px solid var(--border-prominent);
+      border-radius: 6px;
+      padding: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .dna-hash {
+      font-family: 'Fira Code', monospace;
+      font-size: 11px;
+      color: #38bdf8;
+      word-break: break-all;
+      user-select: all;
+    }
+    .dna-tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      font-size: 10px;
+      font-family: 'Fira Code', monospace;
+    }
+    .badge-dna {
+      background: rgba(168, 85, 247, 0.2);
+      color: #c084fc;
+      border: 1px solid rgba(168, 85, 247, 0.4);
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+    .badge-recurrence {
+      background: rgba(245, 158, 11, 0.2);
+      color: #fbbf24;
+      border: 1px solid rgba(245, 158, 11, 0.4);
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+
+    /* Narrative List */
+    .narrative-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .narrative-item {
+      display: flex;
+      gap: 8px;
+      font-size: 12px;
+      line-height: 1.4;
+      color: var(--text-main);
+    }
+    .narrative-bullet { color: var(--color-crimson); font-weight: bold; }
+
+    /* Recovery Section */
+    .recovery-top {
+      background: rgba(16, 185, 129, 0.1);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      border-radius: 6px;
+      padding: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .rec-header {
+      display: flex;
+      justify-content: space-between;
+      font-weight: 700;
+      color: #34d399;
+      font-size: 12px;
+    }
+    .rec-score {
+      font-family: 'Fira Code', monospace;
+      background: rgba(16, 185, 129, 0.2);
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+    .rec-rationale {
+      font-size: 11px;
+      color: var(--text-muted);
+      line-height: 1.35;
+    }
+    .ineligibility-box {
+      border-top: 1px solid var(--border-subtle);
+      padding-top: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .inelig-item {
+      font-size: 11px;
+      color: #fca5a5;
+      background: rgba(239, 68, 68, 0.08);
+      border-left: 2px solid #ef4444;
+      padding: 6px 8px;
+      border-radius: 0 4px 4px 0;
+      line-height: 1.3;
+    }
+
+    /* Risk Section */
+    .risk-item {
+      background: rgba(245, 158, 11, 0.08);
+      border-left: 3px solid var(--color-amber);
+      padding: 8px 10px;
+      border-radius: 0 6px 6px 0;
+      font-size: 11px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .risk-title { font-weight: 700; color: #fbbf24; }
+    .risk-pattern { font-family: 'Fira Code', monospace; font-size: 11px; color: var(--text-main); }
+
+    /* Event Log Table */
+    .event-log {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      max-height: 250px;
+      overflow-y: auto;
+      font-family: 'Fira Code', monospace;
+      font-size: 11px;
+    }
+    .event-row {
+      display: grid;
+      grid-template-columns: 75px 110px 1fr;
+      padding: 4px 8px;
+      border-radius: 4px;
+      background: rgba(0, 0, 0, 0.2);
+      border: 1px solid transparent;
+      align-items: center;
+    }
+    .event-row:hover { border-color: var(--border-prominent); }
+    .badge-op {
+      font-weight: 700;
+      font-size: 10px;
+      padding: 1px 5px;
+      border-radius: 3px;
+      text-align: center;
+      width: fit-content;
+    }
+    .op-LOCK_REQUEST { background: rgba(245, 158, 11, 0.2); color: #fbbf24; }
+    .op-LOCK_ACQUIRED { background: rgba(16, 185, 129, 0.2); color: #34d399; }
+    .op-LOCK_RELEASED { background: rgba(100, 116, 139, 0.2); color: #94a3b8; }
+    .time-col { color: var(--text-dim); }
+    .target-col { color: var(--text-main); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    /* Scrollbars */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: var(--bg-surface); }
+    ::-webkit-scrollbar-thumb { background: var(--border-prominent); border-radius: 3px; }
+  </style>
+</head>
+<body>
+
+  <!-- Top Bar -->
+  <header>
+    <div class="brand">
+      <div class="logo-badge">⚡</div>
+      <div>
+        <div class="brand-title">DeadlockDNA</div>
+        <div class="brand-subtitle" id="target-header">Target: <span id="target-name">Monitoring...</span></div>
+      </div>
+    </div>
+
+    <div class="header-stats">
+      <div class="stat-pill"><span class="label">PID:</span> <span class="val" id="pid-val">--</span></div>
+      <div class="stat-pill"><span class="label">Events:</span> <span class="val" id="events-count">0</span></div>
+      <div class="stat-pill"><span class="label">Threads:</span> <span class="val" id="threads-count">0</span></div>
+      <div class="stat-pill"><span class="label">Locks:</span> <span class="val" id="resources-count">0</span></div>
+      <div class="stat-pill"><span class="label">Uptime:</span> <span class="val" id="uptime-val">00:00</span></div>
+      <div class="status-badge normal" id="main-status-badge">
+        <span class="pulse-circle"></span>
+        <span id="status-text">MONITORING</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main View -->
+  <div class="app-body">
+
+    <!-- Interactive Graph Left -->
+    <div class="graph-pane">
+      <div class="graph-toolbar">
+        <button class="tool-btn" id="btn-fit">🎯 Center View</button>
+        <button class="tool-btn active" id="btn-physics">⚡ Physics ON</button>
+        <button class="tool-btn" id="btn-pause">⏸ Pause</button>
+      </div>
+
+      <div class="graph-legend">
+        <div class="legend-item"><div class="legend-dot dot-thread"></div><span>Thread Node (T)</span></div>
+        <div class="legend-item"><div class="legend-dot dot-mutex"></div><span>Mutex Node (M@)</span></div>
+        <div class="legend-item"><div class="dot-alloc"></div><span>Allocation Edge (Held)</span></div>
+        <div class="legend-item"><div class="dot-req"></div><span>Request Edge (Waiting)</span></div>
+        <div class="legend-item"><div class="dot-deadlock"></div><span>Deadlock Cycle</span></div>
+      </div>
+
+      <!-- Canvas Wrap -->
+      <div class="canvas-wrap" id="canvas-container">
+        <canvas id="rag-canvas"></canvas>
+      </div>
+
+      <!-- Scrubber -->
+      <div class="timeline-bar">
+        <button class="tool-btn" id="btn-replay" style="padding: 4px 10px; font-size: 11px;">▶ Replay</button>
+        <div class="time-label">Time-Travel:</div>
+        <div class="timeline-slider-wrap">
+          <input type="range" min="0" max="0" value="0" class="slider" id="event-slider">
+          <span class="time-label" id="slider-val">Live (0/0)</span>
+        </div>
+        <div class="live-indicator live-active" id="live-btn">
+          <span class="pulse-circle"></span> Live
+        </div>
+      </div>
+    </div>
+
+    <!-- Diagnostics Sidebar Right -->
+    <div class="diag-pane">
+
+      <!-- Deadlock Card -->
+      <div class="card card-deadlock" id="deadlock-card" style="display: none;">
+        <div class="card-title">
+          <span>🚨 DEADLOCK CYCLE DETECTED</span>
+          <span id="latency-tag" style="font-family:'Fira Code'; font-size:11px;">0.0 µs</span>
+        </div>
+
+        <div id="deadlock-cycle-text" style="font-family:'Fira Code'; font-weight:700; color:#f87171; font-size:12px;"></div>
+
+        <!-- DNA Section -->
+        <div class="dna-box">
+          <div style="font-size:10px; color:var(--text-dim); font-weight:700;">DEADLOCK DNA FINGERPRINT (SHA-256)</div>
+          <div class="dna-hash" id="dna-fingerprint">--</div>
+          <div class="dna-tags">
+            <span class="badge-dna" id="dna-pattern">--</span>
+            <span class="badge-recurrence" id="dna-recurrence">Recurrence: 1</span>
+          </div>
+        </div>
+
+        <!-- Explainer Narrative -->
+        <div>
+          <div style="font-size:11px; font-weight:700; color:var(--text-muted); margin-bottom:4px;">ROOT-CAUSE DIAGNOSIS:</div>
+          <div class="narrative-list" id="diagnosis-steps"></div>
+        </div>
+
+        <!-- Recovery Recommendations (Feature E) -->
+        <div style="display:flex; flex-direction:column; gap:8px;">
+          <div style="font-size:11px; font-weight:700; color:var(--text-muted);">RECOMMENDED RESOLUTION (FEATURE E):</div>
+          <div class="recovery-top" id="recovery-recommendation-box">
+            <div class="rec-header">
+              <span id="rec-action">--</span>
+              <span class="rec-score" id="rec-score">Score: 0.00</span>
+            </div>
+            <div class="rec-rationale" id="rec-rationale">--</div>
+          </div>
+
+          <div class="ineligibility-box" id="ineligibility-container">
+            <div style="font-size:10px; font-weight:700; color:#f87171;">SAFETY POLICY REJECTIONS:</div>
+            <div id="ineligibility-list" style="display:flex; flex-direction:column; gap:4px;"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Predictive Risk Hazards Card -->
+      <div class="card" id="risk-card" style="display: none;">
+        <div class="card-title">
+          <span style="color:#fbbf24;">⚠ LOCK-ORDER INVERSION HAZARDS</span>
+          <span style="font-size:10px; color:var(--text-dim);" id="risk-count">0</span>
+        </div>
+        <div id="risk-list" style="display:flex; flex-direction:column; gap:6px;"></div>
+      </div>
+
+      <!-- Live Event Stream -->
+      <div class="card" style="flex:1;">
+        <div class="card-title">
+          <span>Live Ingestion Feed</span>
+          <span style="font-size:10px; color:var(--text-dim);">Recent Events</span>
+        </div>
+        <div class="event-log" id="event-feed">
+          <div style="color:var(--text-dim); text-align:center; padding:20px;">Waiting for eBPF events...</div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <script>
+    // -------------------------------------------------------------
+    // High-Performance Interactive Force-Directed Canvas Graph Engine
+    // (Zero External Dependencies — Works 100% Offline)
+    // -------------------------------------------------------------
+    const canvas = document.getElementById('rag-canvas');
+    const ctx = canvas.getContext('2d');
+    const container = document.getElementById('canvas-container');
+
+    let nodes = new Map(); // id -> { id, label, isThread, x, y, vx, vy, isDeadlock }
+    let edges = [];        // [ { from, to, kind, isDeadlock } ]
+    let deadlocks = [];
+
+    let isLive = true;
+    let isPaused = false;
+    let physicsEnabled = true;
+    let historySnapshots = [];
+
+    // Camera Transform (Pan & Zoom)
+    let panX = 0;
+    let panY = 0;
+    let zoom = 1.0;
+    let isDragging = false;
+    let dragNode = null;
+    let lastMouseX = 0;
+    let lastMouseY = 0;
+
+    function resizeCanvas() {
+      const rect = container.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = rect.width * dpr;
+      canvas.height = rect.height * dpr;
+      ctx.resetTransform();
+      ctx.scale(dpr, dpr);
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    // Center camera on nodes
+    function centerView() {
+      if (nodes.size === 0) {
+        panX = container.clientWidth / 2;
+        panY = container.clientHeight / 2;
+        zoom = 1.0;
+        return;
+      }
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+      nodes.forEach(n => {
+        minX = Math.min(minX, n.x);
+        maxX = Math.max(maxX, n.x);
+        minY = Math.min(minY, n.y);
+        maxY = Math.max(maxY, n.y);
+      });
+
+      const centerX = (minX + maxX) / 2;
+      const centerY = (minY + maxY) / 2;
+      const spanX = Math.max(maxX - minX + 280, 460);
+      const spanY = Math.max(maxY - minY + 280, 380);
+
+      const scaleX = container.clientWidth / spanX;
+      const scaleY = container.clientHeight / spanY;
+      zoom = Math.min(Math.max(Math.min(scaleX, scaleY), 0.5), 1.0);
+
+      panX = (container.clientWidth / 2) - (centerX * zoom);
+      panY = (container.clientHeight / 2) - (centerY * zoom);
+    }
+
+    // Force Simulation Step
+    function stepPhysics() {
+      if (!physicsEnabled) return;
+      const nodeList = Array.from(nodes.values());
+
+      // 1. Repulsion between all node pairs
+      for (let i = 0; i < nodeList.length; i++) {
+        for (let j = i + 1; j < nodeList.length; j++) {
+          const a = nodeList[i];
+          const b = nodeList[j];
+          let dx = b.x - a.x;
+          let dy = b.y - a.y;
+          let dist = Math.hypot(dx, dy) || 1;
+          if (dist < 300) {
+            let force = (2500 / (dist * dist));
+            let fx = (dx / dist) * force;
+            let fy = (dy / dist) * force;
+            if (a !== dragNode) { a.vx -= fx; a.vy -= fy; }
+            if (b !== dragNode) { b.vx += fx; b.vy += fy; }
+          }
+        }
+      }
+
+      // 2. Spring attraction along edges
+      edges.forEach(e => {
+        const a = nodes.get(e.from);
+        const b = nodes.get(e.to);
+        if (!a || !b) return;
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let dist = Math.hypot(dx, dy) || 1;
+        let targetDist = 120;
+        let force = (dist - targetDist) * 0.04;
+        let fx = (dx / dist) * force;
+        let fy = (dy / dist) * force;
+        if (a !== dragNode) { a.vx += fx; a.vy += fy; }
+        if (b !== dragNode) { b.vx -= fx; b.vy -= fy; }
+      });
+
+      // 3. Central gravity
+      nodeList.forEach(n => {
+        if (n === dragNode) return;
+        n.vx -= n.x * 0.005;
+        n.vy -= n.y * 0.005;
+        n.x += n.vx;
+        n.y += n.vy;
+        n.vx *= 0.85; // Damping
+        n.vy *= 0.85;
+      });
+    }
+
+    // Draw Arrow along edge
+    function drawEdge(fromNode, toNode, kind, isDeadlock) {
+      const dx = toNode.x - fromNode.x;
+      const dy = toNode.y - fromNode.y;
+      const dist = Math.hypot(dx, dy) || 1;
+      const nx = dx / dist;
+      const ny = dy / dist;
+
+      // Offsets so arrow stops at node border
+      const startOffset = fromNode.isThread ? 24 : 18;
+      const endOffset = toNode.isThread ? 24 : 18;
+
+      const sx = fromNode.x + nx * startOffset;
+      const sy = fromNode.y + ny * startOffset;
+      const ex = toNode.x - nx * endOffset;
+      const ey = toNode.y - ny * endOffset;
+
+      ctx.save();
+      if (isDeadlock) {
+        ctx.strokeStyle = '#ef4444';
+        ctx.lineWidth = 3.5;
+        ctx.shadowColor = '#ef4444';
+        ctx.shadowBlur = 12;
+      } else if (kind === 'allocation') {
+        ctx.strokeStyle = '#10b981';
+        ctx.lineWidth = 2.2;
+      } else {
+        ctx.strokeStyle = '#f59e0b';
+        ctx.lineWidth = 2.0;
+        ctx.setLineDash([6, 5]);
+      }
+
+      ctx.beginPath();
+      ctx.moveTo(sx, sy);
+      ctx.lineTo(ex, ey);
+      ctx.stroke();
+
+      // Arrowhead
+      ctx.setLineDash([]);
+      const arrowLen = isDeadlock ? 12 : 9;
+      const arrowAngle = Math.PI / 7;
+      const angle = Math.atan2(ey - sy, ex - sx);
+
+      ctx.fillStyle = ctx.strokeStyle;
+      ctx.beginPath();
+      ctx.moveTo(ex, ey);
+      ctx.lineTo(ex - arrowLen * Math.cos(angle - arrowAngle), ey - arrowLen * Math.sin(angle - arrowAngle));
+      ctx.lineTo(ex - arrowLen * Math.cos(angle + arrowAngle), ey - arrowLen * Math.sin(angle + arrowAngle));
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.restore();
+    }
+
+    // Render Canvas Loop
+    let pulseAngle = 0;
+    function render() {
+      stepPhysics();
+
+      const w = container.clientWidth;
+      const h = container.clientHeight;
+      ctx.clearRect(0, 0, w, h);
+
+      ctx.save();
+      ctx.translate(panX, panY);
+      ctx.scale(zoom, zoom);
+
+      pulseAngle += 0.05;
+
+      // Draw Edges
+      edges.forEach(e => {
+        const u = nodes.get(e.from);
+        const v = nodes.get(e.to);
+        if (u && v) drawEdge(u, v, e.kind, e.isDeadlock);
+      });
+
+      // Draw Nodes
+      nodes.forEach(n => {
+        ctx.save();
+        if (n.isDeadlock) {
+          const pulse = 10 + Math.sin(pulseAngle) * 6;
+          ctx.shadowColor = '#ef4444';
+          ctx.shadowBlur = pulse;
+        }
+
+        if (n.isThread) {
+          // Circular Thread Node (compact 22px radius, 44px diameter)
+          const r = 22;
+          ctx.beginPath();
+          ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+          ctx.fillStyle = n.isDeadlock ? '#7f1d1d' : '#0369a1';
+          ctx.fill();
+          ctx.lineWidth = 2.5;
+          ctx.strokeStyle = n.isDeadlock ? '#fca5a5' : '#38bdf8';
+          ctx.stroke();
+
+          // Main Thread ID (e.g. T5001) inside circle
+          let mainText = n.id;
+          let subText = n.function || '';
+          if (!subText && n.label && n.label.includes('(')) {
+            const m = n.label.match(/\((.*?)\)/);
+            if (m) subText = m[1];
+          }
+
+          ctx.fillStyle = '#ffffff';
+          ctx.font = 'bold 11px Fira Code, monospace';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(mainText, n.x, n.y);
+
+          // Subtitle (function name, e.g. thread1) underneath circle
+          if (subText && subText !== 'unknown') {
+            ctx.fillStyle = '#94a3b8';
+            ctx.font = '10px Inter, system-ui, sans-serif';
+            ctx.fillText(subText, n.x, n.y + r + 13);
+          }
+        } else {
+          // Rounded Rectangle Mutex Node
+          let mainText = n.symbol || n.label;
+          if (mainText.includes('(')) {
+            mainText = mainText.split('(')[0].trim();
+          }
+          if (!mainText) mainText = n.id;
+
+          const rw = Math.max(72, Math.min(130, mainText.length * 8 + 18));
+          const rh = 26;
+          const rx = n.x - rw / 2;
+          const ry = n.y - rh / 2;
+
+          ctx.beginPath();
+          ctx.roundRect(rx, ry, rw, rh, 6);
+          ctx.fillStyle = n.isDeadlock ? '#7f1d1d' : '#312e81';
+          ctx.fill();
+          ctx.lineWidth = 2.5;
+          ctx.strokeStyle = n.isDeadlock ? '#fca5a5' : '#818cf8';
+          ctx.stroke();
+
+          // Main mutex label inside pill
+          ctx.fillStyle = '#e2e8f0';
+          ctx.font = '10px Fira Code, monospace';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(mainText, n.x, n.y);
+
+          // Subtitle (location or address) underneath pill
+          let subText = n.location || '';
+          if (!subText && n.label && n.label.includes('(')) {
+            const m = n.label.match(/\((.*?)\)/);
+            if (m) subText = m[1];
+          }
+          if (subText && subText !== mainText && subText !== 'unknown') {
+            ctx.fillStyle = '#94a3b8';
+            ctx.font = '10px Inter, system-ui, sans-serif';
+            ctx.fillText(subText, n.x, n.y + rh / 2 + 12);
+          }
+        }
+
+        ctx.restore();
+      });
+
+      ctx.restore();
+      requestAnimationFrame(render);
+    }
+    requestAnimationFrame(render);
+
+    // Apply Snapshot
+    function applySnapshot(snap) {
+      if (!snap) return;
+
+      document.getElementById('target-name').innerText = snap.target_name || 'Active Target';
+      document.getElementById('pid-val').innerText = snap.pid || '--';
+      document.getElementById('events-count').innerText = snap.total_events || 0;
+
+      const m = Math.floor((snap.uptime_sec || 0) / 60);
+      const s = (snap.uptime_sec || 0) % 60;
+      document.getElementById('uptime-val').innerText = `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+
+      deadlocks = snap.deadlocks || [];
+
+      // Update Node Set
+      const currentNodes = snap.nodes || [];
+      const currentEdges = snap.edges || [];
+      const activeIds = new Set(currentNodes.map(n => n.id));
+
+      // Remove defunct nodes
+      nodes.forEach((_, id) => {
+        if (!activeIds.has(id)) nodes.delete(id);
+      });
+
+      // Add/update nodes
+      const nTotal = currentNodes.length;
+      currentNodes.forEach((n, i) => {
+        const isThread = n.id.startsWith('T');
+        const isDl = deadlocks.some(d => d.cycle && d.cycle.includes(n.id));
+        const label = n.label || (isThread ? n.id : (n.id.includes(':') ? n.id.split(':').pop() : n.id));
+        const func = n.function || '';
+        const symbol = n.symbol || '';
+        const location = n.location || '';
+
+        if (!nodes.has(n.id)) {
+          // Seed with circular initial layout
+          const angle = (i / Math.max(nTotal, 1)) * Math.PI * 2;
+          const radius = 120;
+          nodes.set(n.id, {
+            id: n.id,
+            label: label,
+            isThread: isThread,
+            function: func,
+            symbol: symbol,
+            location: location,
+            x: Math.cos(angle) * radius,
+            y: Math.sin(angle) * radius,
+            vx: 0,
+            vy: 0,
+            isDeadlock: isDl
+          });
+        } else {
+          const existing = nodes.get(n.id);
+          existing.label = label;
+          existing.function = func;
+          existing.symbol = symbol;
+          existing.location = location;
+          existing.isDeadlock = isDl;
+        }
+      });
+
+      // Update Edges
+      edges = currentEdges.map(e => {
+        const isDlEdge = deadlocks.some(d => {
+          if (!d.cycle) return false;
+          for (let i = 0; i < d.cycle.length - 1; i++) {
+            if (d.cycle[i] === e.from && d.cycle[i+1] === e.to) return true;
+          }
+          return false;
+        });
+        return {
+          from: e.from,
+          to: e.to,
+          kind: e.kind,
+          isDeadlock: isDlEdge
+        };
+      });
+
+      document.getElementById('threads-count').innerText = Array.from(nodes.values()).filter(n => n.isThread).length;
+      document.getElementById('resources-count').innerText = Array.from(nodes.values()).filter(n => !n.isThread).length;
+
+      // Auto-center on first receive
+      if (nodes.size > 0 && panX === 0 && panY === 0) {
+        centerView();
+      }
+
+      // Deadlock Card
+      const dlCard = document.getElementById('deadlock-card');
+      const statusBadge = document.getElementById('main-status-badge');
+      const statusText = document.getElementById('status-text');
+
+      if (deadlocks.length > 0) {
+        const dl = deadlocks[0];
+        dlCard.style.display = 'flex';
+        statusBadge.className = 'status-badge deadlock';
+        statusText.innerText = 'DEADLOCK DETECTED';
+
+        document.getElementById('latency-tag').innerText = `${dl.latency_us.toFixed(1)} µs latency`;
+        document.getElementById('deadlock-cycle-text').innerText = (dl.cycle || []).join(' → ');
+
+        document.getElementById('dna-fingerprint').innerText = dl.fingerprint || 'Computing...';
+        document.getElementById('dna-pattern').innerText = dl.canonical_pattern || 'Cycle Pattern';
+        document.getElementById('dna-recurrence').innerText = `Recurrence: ${dl.occurrence_count || 1}x`;
+
+        // Diagnosis
+        const diagContainer = document.getElementById('diagnosis-steps');
+        diagContainer.innerHTML = '';
+        if (dl.diagnosis && dl.diagnosis.steps) {
+          dl.diagnosis.steps.forEach(st => {
+            const row = document.createElement('div');
+            row.className = 'narrative-item';
+            row.innerHTML = `<span class="narrative-bullet">✖</span> <span>${st.description}</span>`;
+            diagContainer.appendChild(row);
+          });
+        }
+
+        // Recovery (Feature E)
+        if (dl.recovery_plan) {
+          const top = dl.recovery_plan.top_recommendation;
+          if (top) {
+            document.getElementById('rec-action').innerText = `★ Recommended: ${top.action_type} (Target: ${top.target_id})`;
+            document.getElementById('rec-score').innerText = `Score: ${top.score.toFixed(2)}`;
+            document.getElementById('rec-rationale').innerText = top.ranking_rationale || '';
+          }
+          const ineligList = document.getElementById('ineligibility-list');
+          ineligList.innerHTML = '';
+          (dl.recovery_plan.rejected_candidates || []).slice(0, 2).forEach(rej => {
+            const item = document.createElement('div');
+            item.className = 'inelig-item';
+            item.innerHTML = `<strong>✗ ${rej.action_type}:</strong> ${rej.ineligibility_reason}`;
+            ineligList.appendChild(item);
+          });
+        }
+      } else {
+        dlCard.style.display = 'none';
+        statusBadge.className = 'status-badge normal';
+        statusText.innerText = 'MONITORING';
+      }
+
+      // Risk Panel
+      const riskCard = document.getElementById('risk-card');
+      const riskList = document.getElementById('risk-list');
+      if (snap.risks && snap.risks.length > 0) {
+        riskCard.style.display = 'flex';
+        document.getElementById('risk-count').innerText = `${snap.risks.length} active`;
+        riskList.innerHTML = '';
+        snap.risks.forEach(rk => {
+          const div = document.createElement('div');
+          div.className = 'risk-item';
+          div.innerHTML = `<div class="risk-title">Hierarchy Inversion (AB/BA Risk)</div>
+                           <div class="risk-pattern">${rk.pattern}</div>`;
+          riskList.appendChild(div);
+        });
+      } else {
+        riskCard.style.display = 'none';
+      }
+
+      // Live Feed
+      if (snap.recent_events && snap.recent_events.length > 0) {
+        const feed = document.getElementById('event-feed');
+        feed.innerHTML = '';
+        snap.recent_events.slice(-10).reverse().forEach(ev => {
+          const row = document.createElement('div');
+          row.className = 'event-row';
+          const timeStr = new Date(ev.timestamp_ns / 1e6).toLocaleTimeString();
+          row.innerHTML = `
+            <span class="time-col">${timeStr}</span>
+            <span class="badge-op op-${ev.operation}">${ev.operation}</span>
+            <span class="target-col">T${ev.tid} ➔ ${ev.resource}</span>
+          `;
+          feed.appendChild(row);
+        });
+      }
+    }
+
+    // Connect Server-Sent Events (SSE)
+    function connectSSE() {
+      const evtSource = new EventSource('/api/stream');
+      evtSource.onmessage = function(e) {
+        if (isPaused) return;
+        try {
+          const data = JSON.parse(e.data);
+          historySnapshots.push(data);
+
+          // Live Uptime Clock
+      const startTime = Date.now();
+      setInterval(() => {
+        const elapsed = Math.floor((Date.now() - startTime) / 1000);
+        const m = Math.floor(elapsed / 60);
+        const s = elapsed % 60;
+        document.getElementById('uptime-val').innerText = `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+      }, 1000);
+
+      // Replay Simulation Loop
+      let replayTimer = null;
+      const replayBtn = document.getElementById('btn-replay');
+
+      function stopReplay() {
+        if (replayTimer) {
+          clearInterval(replayTimer);
+          replayTimer = null;
+          replayBtn.innerText = '▶ Replay';
+          replayBtn.classList.remove('active');
+        }
+      }
+
+      replayBtn.addEventListener('click', () => {
+        if (replayTimer) {
+          stopReplay();
+          return;
+        }
+        if (historySnapshots.length === 0) return;
+
+        replayBtn.innerText = '⏹ Stop';
+        replayBtn.classList.add('active');
+        isLive = false;
+        liveBtn.classList.remove('live-active');
+
+        let currentIdx = 0;
+        slider.value = 0;
+        applySnapshot(historySnapshots[0]);
+        document.getElementById('slider-val').innerText = `Event #1 / ${historySnapshots.length}`;
+
+        replayTimer = setInterval(() => {
+          currentIdx++;
+          if (currentIdx >= historySnapshots.length) {
+            stopReplay();
+            isLive = true;
+            liveBtn.classList.add('live-active');
+            slider.value = historySnapshots.length - 1;
+            document.getElementById('slider-val').innerText = `Live (${historySnapshots.length}/${historySnapshots.length})`;
+            applySnapshot(historySnapshots[historySnapshots.length - 1]);
+            return;
+          }
+          slider.value = currentIdx;
+          document.getElementById('slider-val').innerText = `Event #${currentIdx + 1} / ${historySnapshots.length}`;
+          applySnapshot(historySnapshots[currentIdx]);
+        }, 800);
+      });
+
+      const slider = document.getElementById('event-slider');
+          slider.max = historySnapshots.length - 1;
+
+          if (isLive) {
+            slider.value = slider.max;
+            document.getElementById('slider-val').innerText = `Live (${historySnapshots.length}/${historySnapshots.length})`;
+            applySnapshot(data);
+          }
+        } catch (err) {
+          console.error('SSE Error:', err);
+        }
+      };
+      evtSource.onerror = function() {
+        console.warn('SSE connection interrupted, retrying in 1s...');
+      };
+    }
+
+    // Canvas Mouse Interaction (Pan, Zoom, Drag Nodes)
+    container.addEventListener('mousedown', (e) => {
+      const rect = container.getBoundingClientRect();
+      const mouseX = (e.clientX - rect.left - panX) / zoom;
+      const mouseY = (e.clientY - rect.top - panY) / zoom;
+
+      // Hit-test nodes
+      dragNode = null;
+      for (const n of nodes.values()) {
+        const hitR = n.isThread ? 24 : 36;
+        const dist = Math.hypot(n.x - mouseX, n.y - mouseY);
+        if (dist <= hitR) {
+          dragNode = n;
+          break;
+        }
+      }
+
+      isDragging = true;
+      lastMouseX = e.clientX;
+      lastMouseY = e.clientY;
+    });
+
+    window.addEventListener('mousemove', (e) => {
+      if (!isDragging) return;
+      const dx = e.clientX - lastMouseX;
+      const dy = e.clientY - lastMouseY;
+      lastMouseX = e.clientX;
+      lastMouseY = e.clientY;
+
+      if (dragNode) {
+        dragNode.x += dx / zoom;
+        dragNode.y += dy / zoom;
+        dragNode.vx = 0;
+        dragNode.vy = 0;
+      } else {
+        panX += dx;
+        panY += dy;
+      }
+    });
+
+    window.addEventListener('mouseup', () => {
+      isDragging = false;
+      dragNode = null;
+    });
+
+    container.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const zoomFactor = e.deltaY < 0 ? 1.1 : 0.9;
+      const rect = container.getBoundingClientRect();
+      const mouseX = e.clientX - rect.left;
+      const mouseY = e.clientY - rect.top;
+
+      panX = mouseX - (mouseX - panX) * zoomFactor;
+      panY = mouseY - (mouseY - panY) * zoomFactor;
+      zoom *= zoomFactor;
+      zoom = Math.min(Math.max(zoom, 0.2), 4.0);
+    }, { passive: false });
+
+    // Toolbar and Scrubber Events
+    document.addEventListener('DOMContentLoaded', () => {
+      connectSSE();
+
+      document.getElementById('btn-fit').addEventListener('click', centerView);
+
+      const physBtn = document.getElementById('btn-physics');
+      physBtn.addEventListener('click', () => {
+        physicsEnabled = !physicsEnabled;
+        physBtn.innerText = physicsEnabled ? '⚡ Physics ON' : '⏸ Physics OFF';
+        physBtn.classList.toggle('active', physicsEnabled);
+      });
+
+      const pauseBtn = document.getElementById('btn-pause');
+      pauseBtn.addEventListener('click', () => {
+        isPaused = !isPaused;
+        pauseBtn.innerText = isPaused ? '▶ Resume' : '⏸ Pause';
+        pauseBtn.classList.toggle('active', isPaused);
+      });
+
+      // Live Uptime Clock
+      const startTime = Date.now();
+      setInterval(() => {
+        const elapsed = Math.floor((Date.now() - startTime) / 1000);
+        const m = Math.floor(elapsed / 60);
+        const s = elapsed % 60;
+        document.getElementById('uptime-val').innerText = `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+      }, 1000);
+
+      // Replay Simulation Loop
+      let replayTimer = null;
+      const replayBtn = document.getElementById('btn-replay');
+
+      function stopReplay() {
+        if (replayTimer) {
+          clearInterval(replayTimer);
+          replayTimer = null;
+          replayBtn.innerText = '▶ Replay';
+          replayBtn.classList.remove('active');
+        }
+      }
+
+      replayBtn.addEventListener('click', () => {
+        if (replayTimer) {
+          stopReplay();
+          return;
+        }
+        if (historySnapshots.length === 0) return;
+
+        replayBtn.innerText = '⏹ Stop';
+        replayBtn.classList.add('active');
+        isLive = false;
+        liveBtn.classList.remove('live-active');
+
+        let currentIdx = 0;
+        slider.value = 0;
+        applySnapshot(historySnapshots[0]);
+        document.getElementById('slider-val').innerText = `Event #1 / ${historySnapshots.length}`;
+
+        replayTimer = setInterval(() => {
+          currentIdx++;
+          if (currentIdx >= historySnapshots.length) {
+            stopReplay();
+            isLive = true;
+            liveBtn.classList.add('live-active');
+            slider.value = historySnapshots.length - 1;
+            document.getElementById('slider-val').innerText = `Live (${historySnapshots.length}/${historySnapshots.length})`;
+            applySnapshot(historySnapshots[historySnapshots.length - 1]);
+            return;
+          }
+          slider.value = currentIdx;
+          document.getElementById('slider-val').innerText = `Event #${currentIdx + 1} / ${historySnapshots.length}`;
+          applySnapshot(historySnapshots[currentIdx]);
+        }, 800);
+      });
+
+      const slider = document.getElementById('event-slider');
+      const liveBtn = document.getElementById('live-btn');
+
+      slider.addEventListener('input', (e) => {
+        const idx = parseInt(e.target.value);
+        if (idx === historySnapshots.length - 1) {
+          isLive = true;
+          liveBtn.classList.add('live-active');
+          document.getElementById('slider-val').innerText = `Live (${idx+1}/${historySnapshots.length})`;
+        } else {
+          isLive = false;
+          liveBtn.classList.remove('live-active');
+          document.getElementById('slider-val').innerText = `Event #${idx+1} / ${historySnapshots.length}`;
+        }
+        applySnapshot(historySnapshots[idx]);
+      });
+
+      liveBtn.addEventListener('click', () => {
+        isLive = true;
+        liveBtn.classList.add('live-active');
+        if (historySnapshots.length > 0) {
+          slider.value = historySnapshots.length - 1;
+          document.getElementById('slider-val').innerText = `Live (${historySnapshots.length}/${historySnapshots.length})`;
+          applySnapshot(historySnapshots[historySnapshots.length - 1]);
+        }
+      });
+    });
+  </script>
+</body>
+</html>

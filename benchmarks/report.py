@@ -24,14 +24,14 @@ def gather_environment_info() -> Dict[str, str]:
     cpu_info = platform.processor() or "Unknown"
     # Read /proc/cpuinfo on Linux for friendly CPU model name if available
     cpu_file = Path("/proc/cpuinfo")
-    if cpu_file.exists():
-        try:
+    try:
+        if cpu_file.exists():
             for line in cpu_file.read_text(encoding="utf-8").splitlines():
                 if "model name" in line:
                     cpu_info = line.split(":", 1)[1].strip()
                     break
-        except Exception:
-            pass
+    except OSError:
+        pass
 
     bpftrace_ver = "Not installed"
     if shutil.which("bpftrace"):

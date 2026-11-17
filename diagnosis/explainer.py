@@ -1,4 +1,4 @@
-﻿"""
+"""
 diagnosis/explainer.py — Explainable Deadlock Diagnosis (Feature A)
 
 Translates detected Resource Allocation Graph (RAG) cycles into human-readable,
@@ -12,6 +12,7 @@ import time
 from typing import List, Optional, Dict, Any
 
 from graph.models import thread_node, resource_node
+from .symbol_resolver import SymbolResolver, SymbolInfo
 
 
 class Confidence(str, Enum):
@@ -38,6 +39,11 @@ class DiagnosisStep:
     request_timestamp_ns: Optional[int] = None
     acquire_timestamp_ns: Optional[int] = None
     description: str = ""
+    # Upgrade 1: Rich Source Symbols
+    held_symbol: Optional[str] = None
+    waiting_symbol: Optional[str] = None
+    thread_function: Optional[str] = None
+    source_location: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -51,6 +57,10 @@ class DiagnosisStep:
             "request_timestamp_ns": self.request_timestamp_ns,
             "acquire_timestamp_ns": self.acquire_timestamp_ns,
             "description": self.description,
+            "held_symbol": self.held_symbol,
+            "waiting_symbol": self.waiting_symbol,
+            "thread_function": self.thread_function,
+            "source_location": self.source_location,
         }
 
 
@@ -99,8 +109,12 @@ class DeadlockExplainer:
     Produces structured, evidence-backed diagnostic explanations from RAG cycles.
     """
 
+    def __init__(self, symbol_resolver: Optional[SymbolResolver] = None) -> None:
+        self.symbol_resolver = symbol_resolver or SymbolResolver()
+
     def explain(self, cycle: List[str], rag: Any,
-                timestamp_ns: Optional[int] = None) -> DiagnosisResult:
+                timestamp_ns: Optional[int] = None,
+                pid: Optional[int] = None) -> DiagnosisResult:
         """
         Explain a detected deadlock cycle.
 
@@ -194,9 +208,18 @@ class DeadlockExplainer:
             if alloc_ts is None:
                 has_missing_ts = True
 
+            # Resolve rich symbols for Upgrade 1
+            sym_held = self.symbol_resolver.resolve_resource(r_held, pid)
+            sym_wait = self.symbol_resolver.resolve_resource(r_wait, pid)
+            t_func = self.symbol_resolver.resolve_thread_function(tid, pid)
+            owner_func = self.symbol_resolver.resolve_thread_function(owner_tid, pid) if owner_tid else None
+
             # Format descriptive step string
-            owner_str = f" (owned by TID {owner_tid})" if owner_tid is not None else ""
-            desc = f"TID {tid} holds {r_held} and is waiting for {r_wait}{owner_str}."
+            owner_str = f" (owned by TID {owner_tid} [{owner_func}])" if owner_tid is not None else ""
+            desc = (
+                f"Thread {tid} ('{t_func}') holds {r_held} [{sym_held.display_str}] "
+                f"and is waiting for {r_wait} [{sym_wait.display_str}]{owner_str}."
+            )
 
             step = DiagnosisStep(
                 thread_id=tid,
@@ -209,6 +232,10 @@ class DeadlockExplainer:
                 request_timestamp_ns=req_ts,
                 acquire_timestamp_ns=alloc_ts,
                 description=desc,
+                held_symbol=sym_held.display_str,
+                waiting_symbol=sym_wait.display_str,
+                thread_function=t_func,
+                source_location=sym_wait.location_str,
             )
             steps.append(step)
 

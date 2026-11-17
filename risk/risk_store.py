@@ -8,6 +8,7 @@ Enables cross-run and cross-session lock acquisition order analysis.
 import json
 from pathlib import Path
 import sqlite3
+import sys
 from typing import Dict, List, Optional, Tuple
 
 from .lock_order_tracker import LockOrderEvidence, LockOrderTracker
@@ -24,7 +25,11 @@ class RiskStore:
         if db_path != ":memory:":
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        if db_path != ":memory:" and sys.platform == "win32" and not db_path.startswith("file:"):
+            p_str = Path(db_path).as_posix()
+            self._conn = sqlite3.connect(f"file:{p_str}?nolock=1", uri=True, timeout=30.0, check_same_thread=False)
+        else:
+            self._conn = sqlite3.connect(db_path, timeout=30.0, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._init_db()
 

@@ -13,6 +13,7 @@ import logging
 import os
 from pathlib import Path
 import signal
+import sys
 import time
 from typing import Optional, Set
 
@@ -131,12 +132,33 @@ class RecoveryExecutor:
             elapsed_ms=(time.perf_counter() - t0) * 1000.0,
         )
 
+    @staticmethod
+    def _is_alive(pid: int) -> bool:
+        """Cross-platform check whether process pid is currently running."""
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                kernel32 = ctypes.windll.kernel32
+                handle = kernel32.OpenProcess(0x1000, False, pid)
+                if not handle:
+                    return False
+                exit_code = ctypes.c_ulong()
+                success = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+                kernel32.CloseHandle(handle)
+                if success and exit_code.value != 259:  # STILL_ACTIVE = 259
+                    return False
+                return True
+            except Exception:
+                return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
     def _execute_graceful_shutdown(self, candidate: RecoveryCandidate,
                                    pid: int, timeout_sec: float, t0: float) -> ExecutionResult:
-        try:
-            # Check if process is alive
-            os.kill(pid, 0)
-        except OSError:
+        if not self._is_alive(pid):
             return ExecutionResult(
                 candidate_id=candidate.candidate_id,
                 action_type=candidate.action_type.value,
@@ -165,26 +187,27 @@ class RecoveryExecutor:
         deadline = time.monotonic() + timeout_sec
         while time.monotonic() < deadline:
             # Try waitpid with WNOHANG in case this process is parent
-            try:
-                wpid, _ = os.waitpid(pid, os.WNOHANG)
-                if wpid == pid:
-                    self.allowed_pids.discard(pid)
-                    return ExecutionResult(
-                        candidate_id=candidate.candidate_id,
-                        action_type=candidate.action_type.value,
-                        target_id=str(pid),
-                        executed=True,
-                        success=True,
-                        message=f"Disposable process {pid} terminated cleanly upon cooperative SIGTERM.",
-                        elapsed_ms=(time.perf_counter() - t0) * 1000.0,
-                    )
-            except ChildProcessError:
-                pass
+            if hasattr(os, "WNOHANG"):
+                try:
+                    wpid, _ = os.waitpid(pid, os.WNOHANG)
+                    if wpid == pid:
+                        self.allowed_pids.discard(pid)
+                        return ExecutionResult(
+                            candidate_id=candidate.candidate_id,
+                            action_type=candidate.action_type.value,
+                            target_id=str(pid),
+                            executed=True,
+                            success=True,
+                            message=f"Disposable process {pid} terminated cleanly upon cooperative SIGTERM.",
+                            elapsed_ms=(time.perf_counter() - t0) * 1000.0,
+                        )
+                except (ChildProcessError, OSError):
+                    pass
 
             # Check /proc/<pid>/status for zombie status
             proc_status = Path(f"/proc/{pid}/status")
-            if proc_status.exists():
-                try:
+            try:
+                if proc_status.exists():
                     content = proc_status.read_text()
                     if "State:\tZ" in content:
                         self.allowed_pids.discard(pid)
@@ -197,13 +220,10 @@ class RecoveryExecutor:
                             message=f"Disposable process {pid} terminated cleanly upon cooperative SIGTERM.",
                             elapsed_ms=(time.perf_counter() - t0) * 1000.0,
                         )
-                except OSError:
-                    pass
-
-            try:
-                os.kill(pid, 0)
-                time.sleep(0.05)
             except OSError:
+                pass
+
+            if not self._is_alive(pid):
                 # Process exited cleanly
                 self.allowed_pids.discard(pid)
                 return ExecutionResult(
@@ -215,6 +235,8 @@ class RecoveryExecutor:
                     message=f"Disposable process {pid} terminated cleanly upon cooperative SIGTERM.",
                     elapsed_ms=(time.perf_counter() - t0) * 1000.0,
                 )
+
+            time.sleep(0.05)
 
         # If process did not exit, report honestly without uncontrolled escalation
         return ExecutionResult(

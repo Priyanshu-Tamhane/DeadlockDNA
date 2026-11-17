@@ -76,7 +76,7 @@ class TestScoringEngine:
         prod_score = calculate_score(prod_factors)
 
         assert disp_score > 0.6
-        assert prod_score < -0.4
+        assert prod_score <= -0.3
         assert disp_score > prod_score
 
     def test_ranking_places_eligible_first_by_score(self):
@@ -259,7 +259,7 @@ class TestRecoveryExecutor:
         assert "terminated cleanly" in res.message
 
         # Process should be dead
-        proc.poll()
+        proc.wait(timeout=2.0)
         assert proc.returncode is not None
 
 

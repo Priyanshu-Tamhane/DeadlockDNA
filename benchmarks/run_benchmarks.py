@@ -101,6 +101,8 @@ def main() -> None:
     if args.mode in ("all", "replay"):
         sample_dl = _ROOT / "tests" / "sample_events.json"
         sample_clean = _ROOT / "tests" / "sample_clean_events.json"
+        sample_sqlite = _ROOT / "tests" / "sample_sqlite_events.json"
+        sample_memcached = _ROOT / "tests" / "sample_memcached_events.json"
         if sample_dl.exists():
             runner.add_replay_workload(
                 name="replay_2way_deadlock",
@@ -112,6 +114,20 @@ def main() -> None:
             runner.add_replay_workload(
                 name="replay_clean_sequential",
                 event_file=sample_clean,
+                expected_deadlock=False,
+                runs=args.runs,
+            )
+        if sample_sqlite.exists():
+            runner.add_replay_workload(
+                name="replay_sqlite_heavy_workload",
+                event_file=sample_sqlite,
+                expected_deadlock=False,
+                runs=args.runs,
+            )
+        if sample_memcached.exists():
+            runner.add_replay_workload(
+                name="replay_memcached_striped_locks",
+                event_file=sample_memcached,
                 expected_deadlock=False,
                 runs=args.runs,
             )
